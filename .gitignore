@@ -1,0 +1,9 @@
+firmware/.pio/
+__pycache__/
+*.pyc
+.DS_Store
+# your own values, never committed (see README「本地覆盖」)
+firmware/src/config.local.h
+firmware/platformio.local.ini
+# baked on your Mac from its system fonts before the first build (firmware/gen_font_table.py)
+firmware/src/almanac_font.h

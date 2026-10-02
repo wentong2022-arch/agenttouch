@@ -1,0 +1,48 @@
+# Builds the firmware from scratch the way a new user would (official package
+# sources, no local overrides) and runs the host tests. macOS on purpose: the
+# firmware's Chinese glyph table is baked from the Mac's own system fonts
+# before compiling (firmware/gen_font_table.py), and the host is macOS-only.
+name: build
+on:
+  # docs and pictures alone don't need a firmware build
+  push:
+    paths-ignore: ["**.md", "media/**", "LICENSE*", "THIRD_PARTY_LICENSES/**"]
+  pull_request:
+    paths-ignore: ["**.md", "media/**", "LICENSE*", "THIRD_PARTY_LICENSES/**"]
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: System fonts the glyph tables are baked from
+        run: |
+          sw_vers
+          ls -la /System/Library/Fonts/Supplemental/Songti.ttc "/System/Library/Fonts/Hiragino Sans GB.ttc" /System/Library/Fonts/Menlo.ttc
+          /usr/bin/python3 --version
+      - uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: PlatformIO + Pillow (for /usr/bin/python3, like host/setup.sh)
+        run: |
+          pip install platformio
+          /usr/bin/python3 -m pip install --user pillow==11.3.0
+      - name: Build
+        working-directory: firmware
+        run: pio run -e amoled216
+      - name: The glyph table was baked here, not checked in
+        run: |
+          test -f firmware/src/almanac_font.h
+          test -z "$(git ls-files firmware/src/almanac_font.h)"
+
+  host-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Host tests (standard library only)
+        run: /usr/bin/python3 host/test_host.py

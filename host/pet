@@ -1,0 +1,97 @@
+#!/bin/bash
+# Copyright (c) 2026 yuwentong
+# Licensed under PolyForm Noncommercial 1.0.0 (see LICENSE)
+# pet -- manual on/off switch for the AgentTouch host.
+#
+#   pet on        load the LaunchAgent and start the host (also re-arms login autostart)
+#   pet off       stop the host and unload it, so launchd does NOT bring it back
+#                 (it returns at next login because RunAtLoad stays true; `pet on` earlier)
+#   pet restart   kill + relaunch in place (same as launchctl kickstart -k)
+#   pet status    running? which product/host version? which board is linked? last BLE lines
+#   pet log       follow /tmp/agentpet_host.log
+#   pet claim     make the board follow THIS Mac
+#
+# The host itself stays "always on but quiet" (BLE scan backs off when no board,
+# self-restarts when CoreBluetooth sticks at off); this switch is for when you
+# want it fully gone -- e.g. the board is in a drawer for a week.
+#
+# host/setup.sh copies this file to ~/.agentpet/pet and links it into the PATH
+# (/opt/homebrew/bin or /usr/local/bin).
+
+LABEL=com.agentpet.host
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+LOG=/tmp/agentpet_host.log
+DEPLOY="$HOME/.agentpet"
+
+# read /state (empty string when the host is not answering)
+host_state() { curl -s -m 2 http://127.0.0.1:8788/state; }
+
+case "${1:-status}" in
+  on)
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      echo "pet: already loaded, kicking"
+      launchctl kickstart "$DOMAIN/$LABEL"
+    else
+      launchctl bootstrap "$DOMAIN" "$PLIST" && echo "pet: host started"
+    fi
+    ;;
+  off)
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      launchctl bootout "$DOMAIN/$LABEL" && echo "pet: host stopped (won't come back until 'pet on' or next login)"
+    else
+      echo "pet: host is not loaded"
+    fi
+    ;;
+  restart)
+    launchctl kickstart -k "$DOMAIN/$LABEL" && echo "pet: host restarted"
+    ;;
+  status)
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      pid=$(pgrep -f 'agentpet_host.py' | head -1)
+      if [ -n "$pid" ]; then
+        printf 'pet: host running  pid %s  ' "$pid"
+        ps -o etime=,rss= -p "$pid" | awk '{printf "up %s  rss %d MB\n", $1, $2/1024}'
+      else
+        echo "pet: host loaded but no python process (launchd will retry)"
+      fi
+      st=$(host_state)
+      if [ -n "$st" ]; then
+        echo "$st" | /usr/bin/python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("pet: product=%s  host=%s" % (d.get("product", "?"), d.get("host_version", "?")))
+print("pet: ble=%s  tcp=%s  agents=%s" % (d.get("ble"), d.get("boards"), d.get("agents")))'
+      else
+        echo "pet: HTTP 8788 not answering"
+      fi
+      echo "pet: last BLE lines:"
+      grep -E 'ble|hello|host: restarting' "$LOG" 2>/dev/null | tail -4 | sed 's/^/     /'
+    else
+      echo "pet: host is OFF (not loaded). 'pet on' to start."
+    fi
+    ;;
+  log)
+    tail -f "$LOG"
+    ;;
+  claim)
+    echo "pet: 让板子改跟这台 Mac——请到板子上点绿色的「连接」（最多等 60 秒）…"
+    out=$(curl -s -m 70 -X POST -d '{}' http://127.0.0.1:8788/board/claim)
+    if [ -z "$out" ]; then
+      echo "pet: HTTP 8788 not answering ('pet on' first)"; exit 1
+    fi
+    echo "$out" | /usr/bin/python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+if r.get("ok"): print("pet: 板子现在跟着这台" + ("（本来就是）" if r.get("already") else ""))
+else:
+    why=r.get("why")
+    print("pet:", {"declined":"板子上点了拒绝","timeout":"没连上板子，或 30 秒内没在板子上点「连接」",
+                  "asleep":"板子扣着在睡觉，翻过来再试","busy":"板子正在问另一台 Mac，等它答完再试",
+                  "asking":"板子还在等你点「连接」"}.get(why, "没连上板子: %s" % why)); sys.exit(1)'
+    ;;
+  *)
+    sed -n '2,/^# The host itself/p' "$0" | sed '$d' | grep -v '^# [<>]\{3\} private$'
+    exit 1
+    ;;
+esac

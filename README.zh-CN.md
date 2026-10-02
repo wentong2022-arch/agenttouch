@@ -26,6 +26,10 @@
 </p>
 <p align="center"><sub>空闲 → 干活中 → 等你批准 → 干完了 &nbsp;·&nbsp; 点一下就是批准 &nbsp;·&nbsp; grok 皮肤</sub></p>
 
+https://github.com/user-attachments/assets/155b532f-d46f-4f69-8415-f9d9466a5a21
+
+<p align="center"><sub>60 秒介绍。屏幕上的画面由固件自己的绘图代码画出；整机图、转场和触摸圆点是示意。</sub></p>
+
 ## 它能做什么
 
 - **一眼看到 agent 在干嘛。** 空闲、干活中、等你批准、干完了，各有一张脸。板子有五个席位（Claude Code、Codex、Qoder IDE、千问办公、Qoder 桌面版），左右滑切换，Mac 会把那家的窗口拉到前台。
@@ -122,4 +126,5 @@ AgentTouch 作者：yuwentong。
 **致谢**（许可证原文在 [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES)）：
 grok 皮肤的眼形数据来自 [nasawz/GrokBot](https://github.com/nasawz/GrokBot)（BSD-3-Clause）；
 音频芯片 ES8311 / ES7210 的初始化序列源自 [espressif/esp-bsp](https://github.com/espressif/esp-bsp)（Apache-2.0）；
-提示音的情绪音调取自 [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib) 的 `sing()`。
+提示音的情绪音调取自 [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib) 的 `sing()`；
+介绍视频的配乐是原创的，乐器音色来自 S. Christian Collins 的 [GeneralUser GS](https://www.schristiancollins.com/generaluser)。

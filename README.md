@@ -26,6 +26,10 @@
 </p>
 <p align="center"><sub>Idle → working → needs you → done &nbsp;·&nbsp; Tap to approve &nbsp;·&nbsp; The grok skin</sub></p>
 
+https://github.com/user-attachments/assets/155b532f-d46f-4f69-8415-f9d9466a5a21
+
+<p align="center"><sub>A 60-second tour (Chinese captions). What's on the screen is drawn by the firmware's own code; the product shots, the transitions and the touch markers are illustrative.</sub></p>
+
 ## Features
 
 - **See what your agent is doing.** Idle, working, needs you, done: each has its own face. The board has five seats (Claude Code, Codex, Qoder IDE, QwenWork, Qoder desktop). Swipe to switch, and the Mac brings that agent to the front.
@@ -122,4 +126,5 @@ AgentTouch is made by yuwentong.
 **Acknowledgements** (license texts in [`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES)):
 the grok skin's eye shapes come from [nasawz/GrokBot](https://github.com/nasawz/GrokBot) (BSD-3-Clause);
 the ES8311 / ES7210 codec setup derives from [espressif/esp-bsp](https://github.com/espressif/esp-bsp) (Apache-2.0);
-the sounds' pitch contours come from `sing()` in [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib).
+the sounds' pitch contours come from `sing()` in [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib);
+the intro video's music is original, played with instruments from [GeneralUser GS](https://www.schristiancollins.com/generaluser) by S. Christian Collins.

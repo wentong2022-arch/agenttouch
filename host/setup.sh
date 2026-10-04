@@ -246,7 +246,8 @@ case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN 不在 PATH 里：在 ~/.zshrc �
 # ---------------------------------------------------------------------------
 step "7. Claude Code hooks"
 n=$(grep -o 'src=agentpet' "$HOME/.claude/settings.json" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$n" -ge 7 ]; then ok "~/.claude/settings.json 已有 $n 条"
+# older hooks lack the session headers (several Claude Code windows): re-run
+if [ "$n" -ge 7 ] && grep -q 'X-AT-Pid' "$HOME/.claude/settings.json"; then ok "~/.claude/settings.json 已有 $n 条"
 elif doit "install_hooks.py"; then "$PY" "$SRC/install_hooks.py" | sed 's/^/    /'; did "已装"; fi
 
 # ---------------------------------------------------------------------------

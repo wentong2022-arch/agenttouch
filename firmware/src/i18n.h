@@ -22,6 +22,7 @@ enum StrId : uint8_t {
   S_NP_EMPTY, S_NP_HINT, S_POD_EMPTY, S_POD_HINT,
   S_APP_NETEASE, S_APP_MUSIC, S_APP_PODCASTS, S_APP_CHROME, S_APP_SAFARI,
   S_CLAIM_Q, S_CLAIM_OK, S_CLAIM_DONE, S_CLAIM_NEW, S_CLAIM_FROM,   // claim card
+  S_APPROVE_ON_MAC,                          // host toast {"k":"mac_approve"}
   N_STRS
 };
 
@@ -36,6 +37,7 @@ static const char* const STR[N_LANGS][N_STRS] = {
     "卡上还没有节目", "在 Mac 设置页「听什么」贴一个 RSS 或文件",
     "网易云音乐", "Apple Music", "播客", "Chrome", "Safari",
     "连到这台 Mac？", "连接", "已连接", "还没有主人", "现在跟着「%s」",
+    "请在 Mac 上批准",
   },
   {   // en
     "Approve", "hold to reject", "Send",
@@ -47,6 +49,7 @@ static const char* const STR[N_LANGS][N_STRS] = {
     "No episodes on the card", "Add an RSS or file under Listen on the Mac settings page",
     "NetEase Music", "Apple Music", "Podcasts", "Chrome", "Safari",
     "Connect to this Mac?", "Connect", "Connected", "No owner yet", "Currently following \"%s\"",
+    "Approve on the Mac",
   },
 };
 

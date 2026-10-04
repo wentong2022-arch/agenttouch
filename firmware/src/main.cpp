@@ -159,7 +159,15 @@ static uint32_t pinLitUntil = 0;          // seat-color highlight, then grey
 static const uint32_t PIN_LIT_MS = 10000;
 static uint32_t toastUntil = 0;           // 1.5 s pill 名牌 (钉住 / 解除钉住 / 命运自有回应)
 static char     toastText[64] = "";   // 64: English 名牌 are longer
-static void showToast(const char* s) { strlcpy(toastText, s, sizeof(toastText)); toastUntil = millis() + 1500; }
+// set by the host's mac_approve toast: on the face page that pill takes the
+// approve bubble's place (the bubble is what could not be honoured), instead
+// of half-covering it and its hint at the default y (device shot 2026-10-04)
+static bool     toastOnBubble = false;
+static void showToast(const char* s, uint32_t ms = 1500) {
+  strlcpy(toastText, s, sizeof(toastText));
+  toastUntil = millis() + ms;
+  toastOnBubble = false;
+}
 // voice_style (host cfg "voice": chirp|tts, NVS "vtts"): with TTS on and the
 // TCP link up the HOST speaks fresh needs_you/done (and falls back to pushing
 // the chirp if synthesis fails) — so the board keeps quiet for those two.
@@ -224,6 +232,7 @@ static uint32_t sendUntil = 0;
 // it must land where the words did, even though the bubble is tapped later
 // (on the face page) and the seat may have moved meanwhile.
 static bool voiceToFront = false;
+static char voiceSid[9] = "";          // the session that utterance went to
 static uint32_t demoStart       = 0;   // != 0 while the 8-face demo runs
 static int8_t   demoFace        = -1;  // -1 = full tour, else one fixed face
 static uint32_t lastRx = 0, lastPing = 0, lastStateReq = 0;
@@ -428,6 +437,173 @@ static void sendEvent(const char* type, const char* key = nullptr,
   d["t"] = type;
   if (key) d[key] = val;
   sendJson(d);
+}
+
+// Host wire names of AgentState, shared by {"t":"state"} and {"t":"sess"}.
+static uint8_t stateByName(const char* s) {
+  if (!strcmp(s, "idle"))      return ST_IDLE;
+  if (!strcmp(s, "working"))   return ST_WORKING;
+  if (!strcmp(s, "needs_you")) return ST_NEEDS_YOU;
+  if (!strcmp(s, "done"))      return ST_DONE;
+  return ST_OFF;
+}
+
+// ---- Claude 多会话 ----
+// Several Claude Code terminals at once: the host pushes the seat's session
+// list ({"t":"sess","a":"claude","cur":id8,"list":[{id,ti,dir,st}…]}, start
+// order, ≤ 8) and the face shows ONE of them — "what you see on the board is
+// what you act on". A top row names it (title + 「n/N」, face.cpp) and the
+// top band's halves step through the list; approve / reject / dictation /
+// the send bubble's Return carry its id ("sid") so the host lands them in
+// that terminal tab. Fewer than two sessions = no table = today's board to
+// the pixel. One table, owned by the seat it came for (only Claude sends one
+// today; the wire is per seat so Codex / Qoder can reuse it later). Forgotten
+// when the host link drops or the owner Mac changes: the host re-sends it.
+static const int SESS_MAX = 8;
+struct SessItem {
+  char    id[9];              // session_id, first 8 chars
+  char    ti[65];             // Claude's ai-title, ≤ 64 bytes (may be "")
+  char    dir[33];            // folder name, host already made it unique
+  uint8_t st;                 // AgentState of THIS session
+};
+static SessItem sessList[SESS_MAX];
+static char     sessLabel[SESS_MAX][72];   // what the row prints, fitted to 300 px
+static bool     sessLabelCard = false;     // tiny18.afn was ready when labelled
+static uint8_t  sessN = 0, sessCur = 0;
+static int8_t   sessSeat = -1;             // AGENTS index the table belongs to
+static int8_t   sessDir = 1;               // roll direction of the latest change
+static uint16_t sessGen = 0;               // bumps when the current one / the count moves
+static int8_t   sessLit = 0;               // chevron lit after a tap: -1 ‹ / +1 ›
+static uint32_t sessLitUntil = 0;
+static uint32_t sessTapAt = 0;             // last top-band tap (local-wins window)
+static bool     sessTapped = false;        // sessTapAt is meaningful
+
+static bool sessActive() { return sessN >= 2 && sessSeat == selected; }
+// The selected seat's state as the face sees it: the current session's while
+// the row exists, else the seat's merged state. The needs_you screen grab,
+// the seat auto-switch and the needs / done chirps stay on agentStates[]
+// (host-merged, "any session waits") on purpose.
+static uint8_t sessEffState() {
+  return sessActive() ? sessList[sessCur].st : agentStates[selected];
+}
+// counter turns green: the current session waits AND another one does too
+static bool sessQueued() {
+  if (!sessActive() || sessList[sessCur].st != ST_NEEDS_YOU) return false;
+  for (int i = 0; i < sessN; i++)
+    if (i != sessCur && sessList[i].st == ST_NEEDS_YOU) return true;
+  return false;
+}
+static int sessFind(const char* id) {
+  if (!id || !*id) return -1;
+  for (int i = 0; i < sessN; i++)
+    if (!strcmp(sessList[i].id, id)) return i;
+  return -1;
+}
+static void sessClear() {
+  sessN = 0; sessCur = 0; sessSeat = -1;
+  sessTapped = false;
+}
+
+// Copy at most n-1 bytes without splitting a UTF-8 sequence.
+static void sessCopy(char* dst, size_t n, const char* src) {
+  size_t len = strlen(src);
+  if (len >= n) {
+    len = n - 1;
+    while (len && ((uint8_t)src[len] & 0xC0) == 0x80) len--;
+  }
+  memcpy(dst, src, len);
+  dst[len] = 0;
+}
+
+// What the row calls a session: its title minus a leading
+// 「✳」/「*」 (the Warp tab spinner) and spaces; no title -> the folder. Without
+// the card's tiny18.afn always the folder — a title would be tofu boxes —
+// and a title tiny18 cannot draw (an emoji, a glyph missing from the card)
+// falls back the same way. Fitted once here, not per frame: the first lookup
+// of a card glyph is a microSD read.
+static void sessRelabel() {
+  sessLabelCard = sdFontReady(SDF_TINY);
+  for (int i = 0; i < sessN; i++) {
+    const char* ti = sessList[i].ti;
+    for (;;) {
+      if (*ti == ' ' || *ti == '*') { ti++; continue; }
+      if (!strncmp(ti, "\xE2\x9C\xB3", 3)) { ti += 3; continue; }   // ✳ U+2733
+      break;
+    }
+    const char* dir = sessList[i].dir;
+    const char* s = ti;
+    if (!*ti || !sessLabelCard || !almanacHasAllSmall(ti)) s = *dir ? dir : ti;
+    if (!*s) s = sessList[i].id;
+    almanacFitSmallTrack(sessLabel[i], sizeof(sessLabel[i]), s, 300, 1);
+  }
+}
+
+// host {"t":"sess"}: the whole list every time (~200 ms coalesced on its side)
+static void sessHandle(JsonDocument& d) {
+  int seat = agentIdxById(d["a"] | "");
+  if (seat < 0) return;
+  JsonArrayConst arr = d["list"].as<JsonArrayConst>();
+  int n = (int)arr.size();
+  if (n > SESS_MAX) n = SESS_MAX;
+  if (n < 2) {                         // 0 / 1 session: no row, today's board
+    if (sessSeat == seat) sessClear();
+    return;
+  }
+  // the current one before this message, to tell what moved
+  char oldId[9] = "";
+  bool had = sessN >= 2 && sessSeat == seat;
+  int oldN = had ? sessN : 0, oldIdx = had ? sessCur : 0;
+  if (had) strlcpy(oldId, sessList[sessCur].id, sizeof(oldId));
+  int i = 0;
+  for (JsonObjectConst o : arr) {
+    if (i >= n) break;
+    SessItem& it = sessList[i++];
+    sessCopy(it.id, sizeof(it.id), o["id"] | "");
+    sessCopy(it.ti, sizeof(it.ti), o["ti"] | "");
+    sessCopy(it.dir, sizeof(it.dir), o["dir"] | "");
+    it.st = stateByName(o["st"] | "off");
+  }
+  sessN = (uint8_t)n;
+  sessSeat = (int8_t)seat;
+  // A tap wins over a push that crossed it on the wire: for 600 ms after
+  // the last top-band tap a different `cur` from the host is the host not
+  // having seen the tap yet (it answers our sess_sel), so keep ours — as
+  // long as ours is still in the list. After that the host decides.
+  int idx = -1;
+  if (had && sessTapped && (int32_t)(millis() - sessTapAt) < 600) idx = sessFind(oldId);
+  if (idx < 0) idx = sessFind(d["cur"] | "");
+  if (idx < 0) idx = sessFind(oldId);   // host named none of its own: stay put
+  if (idx < 0) idx = 0;
+  sessCur = (uint8_t)idx;
+  bool curMoved = strcmp(oldId, sessList[idx].id) != 0;
+  if (curMoved || n != oldN) {
+    // host-driven moves roll by index (higher = up, lower = down), measured
+    // from where the old current sits in the NEW list; a count-only change
+    // (a session started / ended elsewhere) rolls up, as on the canvas
+    int from = sessFind(oldId);
+    if (from < 0) from = oldIdx;
+    sessDir = (curMoved && idx < from) ? -1 : 1;
+    sessGen++;                         // face.cpp: the row gets its 3 s again
+  }
+  sessRelabel();
+}
+
+// Top band tap (dir -1 = left half = previous, +1 = right half = next, wraps):
+// the board switches at once and tells the host, which follows on the Mac
+// after the hand has been still for 1.5 s.
+static void sessStep(int dir) {
+  if (!sessActive()) return;
+  sessCur = (uint8_t)((sessCur + (dir < 0 ? sessN - 1 : 1)) % sessN);
+  sessDir = dir < 0 ? -1 : 1;
+  sessLit = sessDir;
+  sessLitUntil = millis() + 300;
+  sessTapAt = millis();
+  sessTapped = true;
+  sessGen++;
+  JsonDocument d;
+  d["t"] = "sess_sel"; d["a"] = AGENTS[sessSeat].id; d["id"] = sessList[sessCur].id;
+  sendJson(d);
+  audioPlay(SND_TICK);
 }
 
 // 隐藏 = 当前 off 就不画: the seat we are sitting on
@@ -1247,6 +1423,7 @@ static void ownerApply(JsonDocument& d, bool claim) {
   ownerReply(r);
   if (!changed) return;
   Serial.printf("owner: now %s (%s)\n", ownerName.c_str(), claim ? "claim" : "first host");
+  sessClear();                          // the old Mac's terminals are not this one's
   JsonDocument rel;
   rel["t"] = "released"; rel["by"] = ownerName; rel["id"] = ownerId;
   String rs; serializeJson(rel, rs);
@@ -1389,13 +1566,7 @@ static void handleLine(const String& line) {
     for (JsonPairConst kv : ag) {
       int idx = agentIdxById(kv.key().c_str());
       if (idx < 0) continue;
-      const char* s = kv.value() | "off";
-      uint8_t st = ST_OFF;
-      if      (!strcmp(s, "idle"))      st = ST_IDLE;
-      else if (!strcmp(s, "working"))   st = ST_WORKING;
-      else if (!strcmp(s, "needs_you")) st = ST_NEEDS_YOU;
-      else if (!strcmp(s, "done"))      st = ST_DONE;
-      agentStates[idx] = st;
+      agentStates[idx] = stateByName(kv.value() | "off");
     }
     if (memcmp(prev, agentStates, sizeof(prev)) != 0) noteActivity();
     // chirp on fresh needs_you / done from any agent (needs wins the push)
@@ -1535,6 +1706,17 @@ static void handleLine(const String& line) {
     sendJson(r);
   } else if (strcmp(t, "wifi") == 0) {     // Mac settings page: board Wi-Fi list
     wifiHandle(d);
+  } else if (strcmp(t, "sess") == 0) {      // Claude 多会话: the seat's session list
+    sessHandle(d);
+  } else if (strcmp(t, "toast") == 0) {     // host one-liner on the pill 名牌
+    // mac_approve: an approve for a session the host cannot reach tab-exactly
+    // (app-level terminal with ≥2 sessions) — it typed nothing, the human
+    // answers on the Mac. Unknown kinds are ignored (newer host, older board).
+    const char* k = d["k"] | "";
+    if (!strcmp(k, "mac_approve")) {
+      showToast(tr(S_APPROVE_ON_MAC), 2000);
+      toastOnBubble = true;
+    }
   } else if (strcmp(t, "nudge") == 0) {     // host debug (/test/nudge): status toast + seat dots for 3 s, for /test/shot
     nudgeUntil = millis() + 3000;
   } else if (strcmp(t, "pin") == 0) {       // host debug (/test/pin/0|1): 钉住
@@ -1876,7 +2058,10 @@ static void handleLine(const String& line) {
 }
 
 static void sdFileArrived(const char* path) {
-  if (sdFontIsFontPath(path)) { sdFontLoadAll(); wdtFeed(); }   // fresh font file: re-index (~0.4 s)
+  if (sdFontIsFontPath(path)) {                  // fresh font file: re-index (~0.4 s)
+    sdFontLoadAll(); wdtFeed();
+    sessRelabel();                               // titles may now be drawable
+  }
   if (strncmp(path, "/agentpet/audio/", 16) == 0) playerRescan();   // new episode on the card
   if (strcmp(path, npMissAsked) == 0) npMissAsked[0] = 0;   // the cover we asked for landed
   coverForget(path);                             // ...so stop showing the placeholder for it
@@ -2427,20 +2612,29 @@ static void execPendingSwipe() {
 // stays live even while the pin is invisible (desk + unpinned) — otherwise
 // there would be no way back on from the desk.
 static const int PIN_HIT = 64;
-// Native touch point -> the face page's view frame (the face renders with
-// canvas rotation (4-shownRot)&3); the pin and the claim card test here.
-static void faceViewXY(int x, int y, int& vx, int& vy) {
-  switch ((4 - shownRot) & 3) {
-    case 1:  vx = LCD_W - 1 - y; vy = x;             break;
-    case 2:  vx = LCD_W - 1 - x; vy = LCD_H - 1 - y; break;
-    case 3:  vx = y;             vy = LCD_H - 1 - x; break;
-    default: vx = x;             vy = y;             break;
-  }
-}
 static bool pinHit(int x, int y) {
+  // pageXY, the device-validated table: faceViewXY flips y in rotations 1/3
+  // (the claim card found it 2026-09-26), which put the pin's hit zone in the
+  // view's TOP-right corner on a side-lying board — over the session row's ›,
+  // and nowhere near the pin icon itself
   int vx, vy;
-  faceViewXY(x, y, vx, vy);
+  pageXY(x, y, vx, vy);
   return vx >= LCD_W - PIN_HIT && vy >= LCD_H - PIN_HIT;
+}
+
+// Claude 多会话 top band: y < 110 of the face's view frame, cut
+// at x 240 — -1 = left half (previous), +1 = right half (next), 0 = not a
+// session tap. Live only while the row is on screen and the seat on screen
+// owns ≥2 sessions; a hidden row leaves the top as a plain tap (nudge).
+// pageXY, not faceViewXY: the claim card found faceViewXY flips y in canvas
+// rotations 1/3 (device, 2026-09-26) — with it, a face grabbed by needs_you
+// onto a side-lying board would put this band at the bottom, over the bubble.
+static int sessTopHalf(int x, int y) {
+  if (!sessActive() || !faceSessRowShown()) return 0;
+  int vx, vy;
+  pageXY(x, y, vx, vy);
+  if (vy >= 110) return 0;
+  return vx < 240 ? -1 : 1;
 }
 
 static void touchPoll() {
@@ -2500,10 +2694,11 @@ static void touchPoll() {
     tpLastX = x; tpLastY = y;
 
     // hold ~1.5 s on the face = settings card. The approve bubble keeps its
-    // own long-press (reject), so the hold is inert while needs_you is up.
+    // own long-press (reject), so the hold is inert while needs_you is up
+    // (the bubble's own rule: the current session's state).
     if (tpWasDown && !tpConsumed && !pendH && !pendV && !demoStart &&
         shownPage == PAGE_FACE && !listening &&
-        agentStates[selected] != ST_NEEDS_YOU &&
+        sessEffState() != ST_NEEDS_YOU &&
         (int32_t)(petUntil - millis()) <= 0 &&
         (int32_t)(setCardUntil - millis()) <= 0 && !claimShowing() &&
         (int32_t)(millis() - tpDownAt) >= 1500 &&
@@ -2548,7 +2743,7 @@ static void touchPoll() {
       uint32_t nowMs = millis();
       if (claimOn && (int32_t)(nowMs - claimAt) >= 400 && (int32_t)(tpDownAt - claimAt) >= 0 &&
           !hswipe && !vswipe && !wasPetting) {
-        // pageXY, not the pin's faceViewXY: the face is drawn with the same
+        // pageXY, not the old faceViewXY (gone 2026-10-04): the face is drawn with the same
         // canvas rotation as the side pages, and pageXY is the device-
         // validated table (faceViewXY flips y in rotations 1/3 — a side-lying
         // tap on Connect landed "outside the card", 2026-09-26 19:50).
@@ -2608,30 +2803,47 @@ static void touchPoll() {
         execPendingSwipe();
       } else if (!hswipe && !vswipe) {
         uint32_t nowMs = millis();
-        if (pinHit(tpLastX, tpLastY)) {
+        // the decision follows the CURRENT session (the bubble does)
+        bool effNeeds = sessEffState() == ST_NEEDS_YOU;
+        // a ≥700 ms hold is a reject anywhere on the face, the top band too
+        bool rejectHold = effNeeds && (int32_t)(nowMs - tpDownAt) >= 700;
+        bool pin = pinHit(tpLastX, tpLastY);
+        int half = (pin || rejectHold) ? 0 : sessTopHalf(tpLastX, tpLastY);
+        if (pin) {
           // corner pin wins the tap before every other face action (doc/06):
           // status toast, double-tap profile and the approve bubble all live
           // in the middle, so the corner is unambiguously about pinning.
           setPinned(!pinned, PAGE_FACE);
+        } else if (half) {
+          // Claude 多会话: the session row is showing, so the top
+          // band (y < 110) steps the list — left half back, right half on.
+          // Not a "tap" for the double-tap clock: two quick taps here are two
+          // steps, and a tap on the face right after must not open the card.
+          sessStep(half);
         } else if ((int32_t)(sendUntil - nowMs) > 0) {  // bubble armed: send!
           sendUntil = 0;
           JsonDocument kd;      // same destination the words went to
           kd["t"] = "key"; kd["k"] = "enter";
           if (voiceToFront) kd["to"] = "front";
+          else if (voiceSid[0]) kd["sid"] = voiceSid;   // the session it was said to
           sendJson(kd);
           audioPlay(SND_DONE);
         } else if ((int32_t)(profUntil - nowMs) > 0) {  // card open: dismiss
           profUntil = 0;     // skin picking lives on the settings card now
           audioPlay(SND_TICK);
-        } else if (agentStates[selected] == ST_NEEDS_YOU &&
-                   (hostUp || bleConnected())) {
+        } else if (effNeeds && (hostUp || bleConnected())) {
           // approve bubble is up: tap = approve, hold >=700 ms = reject.
           // 1 s debounce so a nervous double-tap can't stack extra Enters.
           static uint32_t lastDecideAt = 0;
           if ((int32_t)(nowMs - lastDecideAt) > 1000) {
             lastDecideAt = nowMs;
             bool rej = (int32_t)(nowMs - tpDownAt) >= 700;
-            sendEvent("key", "k", rej ? "reject" : "approve");
+            JsonDocument kd;
+            kd["t"] = "key"; kd["k"] = rej ? "reject" : "approve";
+            // which session this decides; the host drops it if
+            // that session no longer waits (answered on the Mac meanwhile)
+            if (sessActive()) kd["sid"] = sessList[sessCur].id;
+            sendJson(kd);
             audioPlay(rej ? SND_SIGH : SND_DONE);
             nudgeUntil = nowMs + 2500;   // toast shows who got the decision
           }
@@ -2646,7 +2858,7 @@ static void touchPoll() {
           }
           nudgeUntil = nowMs + 3000;  // tap = "what's up?" status toast
         }
-        lastTapAt = nowMs;
+        if (!half) lastTapAt = nowMs;
       }
     } else if (shownPage == PAGE_CALENDAR && almanacView && vv) {
       // 换一签 (2026-09-22, user): up = next reading, down
@@ -2912,6 +3124,7 @@ void loop() {
 
   if (sdPoll()) {                      // card slotted while running
     sdFontLoadAll();
+    sessRelabel();                     // card titles vs folder names
     almanacFromCard(clockEpoch());
     playerInit();
     wdtFeed();                         // four index/scan passes over a cold
@@ -2960,6 +3173,14 @@ void loop() {
     // the hand (or grabbed by needs_you) still talks to its own seat.
     voiceToFront = shownPage != PAGE_FACE;
     if (voiceToFront) d["to"] = "front";
+    // face-page dictation goes to the session on screen; latched like
+    // voiceToFront so the send bubble's Return lands in the same tab even if
+    // the row moves on before the tap. Desk pages stay "front" only.
+    voiceSid[0] = 0;
+    if (!voiceToFront && sessActive()) {
+      strlcpy(voiceSid, sessList[sessCur].id, sizeof(voiceSid));
+      d["sid"] = voiceSid;
+    }
     d["mic"] = micOnTalk && audioMicAvailable();   // tells the host frames follow
     if (micOnTalk) micSessionStart();
     d["link"] = micLink == MICLINK_BLE ? "ble" : micLink == MICLINK_TCP ? "tcp" : "none";
@@ -3101,6 +3322,13 @@ void loop() {
       Serial.println("ble: hello sent");
     }
     prevSub = sub;
+  }
+
+  // no host on either link = a stale session list; the host pushes
+  // a fresh one once it is back (and after a card swap re-label it)
+  if (sessN) {
+    if (!(hostUp || bleConnected())) sessClear();
+    else if (sdFontReady(SDF_TINY) != sessLabelCard) sessRelabel();
   }
 
   // charger = feeding time; charge-done = satisfied burp (2 s PMU poll).
@@ -3347,6 +3575,23 @@ void loop() {
     f.bored     = (int32_t)(boredUntil - now) > 0;
     f.stretch   = (int32_t)(stretchUntil - now) > 0;
     for (int i = 0; i < N_AGENTS; i++) f.agentStates[i] = agentStates[i];
+    // Claude 多会话: with ≥2 sessions on the seat on screen
+    // the face, the bottom state word, this seat's dot, the approve bubble and
+    // the pinned toast all follow the CURRENT session. Only this frame's copy
+    // changes: the screen grab above, the seat auto-switch and the chirps keep
+    // reading the host-merged agentStates[].
+    if (sessActive()) {
+      uint8_t es = sessList[sessCur].st;
+      f.st = (AgentState)es;
+      f.agentStates[selected] = es;
+      f.sessN     = sessN;
+      f.sessCur   = sessCur;
+      f.sessTitle = sessLabel[sessCur];
+      f.sessQueue = sessQueued();
+      f.sessDir   = sessDir;
+      f.sessLit   = (int32_t)(sessLitUntil - now) > 0 ? sessLit : 0;
+    }
+    f.sessGen = sessGen;
     f.showOff = showOffSeats;
     f.wifiUp = WiFi.status() == WL_CONNECTED;
     f.hostUp = hostUp || bleConnected();
@@ -3437,6 +3682,7 @@ void loop() {
       f.dizzy = f.petting = f.eating = f.burp = f.bored = f.stretch = false;
       f.sendK = 0;
       f.setK = 0;
+      f.sessN = 0;          // the tour shows faces, not sessions
       switch (step) {
         case 0: f.st = ST_WORKING;   break;
         case 1: f.st = ST_NEEDS_YOU; break;
@@ -3469,14 +3715,17 @@ void loop() {
       f.st = f.claimDone ? ST_DONE : ST_NEEDS_YOU;
       f.offline = f.listening = f.nudge = f.petting = f.bored = f.stretch = false;
       f.sendK = f.profK = f.setK = f.volK = 0;
+      f.sessN = 0;          // modal: no session row floating above the card
     }
     // a face shown away from its home orientation still faces the viewer:
     // grabbed from a side orientation (bound) or pulled in by needs_you on
     // a desk-placed side page (doc/06). rotSec is 0 on the plain face page,
     // so this is a no-op there.
     canvas->setRotation((4 - rotSec) & 3);
+    f.hideBubble = toastOnBubble && pinK > 0.0f;
     faceRender(canvas, f, now);
-    drawPillToast(canvas, pinLabel, pinK);   // the 名牌 rides on top of any page
+    // the 名牌 rides on top of any page; mac_approve sits where the bubble was
+    drawPillToast(canvas, pinLabel, pinK, f.hideBubble ? 341 : 368);
     canvas->setRotation(0);
     canvas->flush();
   }

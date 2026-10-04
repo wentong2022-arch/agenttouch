@@ -22,8 +22,16 @@ MARK = "agentpet"   # identifies our hook commands
 EVENTS = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification",
           "Stop", "SessionStart", "SessionEnd"]
 
+# Which terminal tab the session lives in (several Claude Code
+# windows at once): the claude PID ($PPID of the hook shell), its tty and the
+# terminal's own variables, as headers so nothing needs URL-encoding. An
+# empty value is simply ignored by the host.
+HEADERS = ('-H "X-AT-Pid: $PPID" -H "X-AT-Tty: $(ps -o tty= -p $PPID 2>/dev/null)" '
+           '-H "X-AT-Term: $TERM_PROGRAM" -H "X-AT-Bundle: $__CFBundleIdentifier" '
+           '-H "X-AT-Warp: $WARP_FOCUS_URL" -H "X-AT-Iterm: $ITERM_SESSION_ID" ')
+
 def cmd(event):
-    return (f"curl -s -m 2 -X POST --data-binary @- "
+    return (f"curl -s -m 2 -X POST --data-binary @- {HEADERS}"
             f"'http://127.0.0.1:8788/hook/claude/{event}?src={MARK}' || true")
 
 def main():

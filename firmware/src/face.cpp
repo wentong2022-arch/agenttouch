@@ -766,6 +766,126 @@ static bool grokEyes(Arduino_Canvas* c, uint8_t gst, const FaceFrame& f,
   return true;
 }
 
+// Toast fade from the age of the last surfacing: 250 ms in, hold, the last
+// 400 ms of a 3 s life out (the hold — nudge / needs_you — is the caller's).
+static float toastAgeK(int32_t age) {
+  if (age < 0 || age >= 3000) return 0.0f;
+  if (age < 250)  return age / 250.0f;
+  if (age > 2600) return (3000 - age) / 400.0f;
+  return 1.0f;
+}
+
+// ---- Claude 多会话 top row -------------------------------------------------
+// Design: Board.dc.html drawTopRow style A + drawChevrons
+// One centred line at baseline 52: the current session's title + 12 px + a
+// dim 「n/N」, on a pure-black rounded backing (8 / 6 px padding, r 8) so the
+// bunny's ear tip passing behind it cannot eat the words — the same rule on
+// all six skins. The backing is opaque the moment the row shows (no alpha on
+// this canvas): the ear is cut for the 250 ms fade-in rather than fading.
+// ‹ › at x 28 / 452 mark the two tap halves. A change rolls only what changed:
+// old text slides 14 px out and fades, new text comes in from the other side,
+// 260 ms smoothstep; +1 = up (right half / higher index), -1 = down.
+static const uint16_t SR_TITLE = C565(0xC9, 0xCF, 0xD6);
+static const uint16_t SR_DIM   = C565(0x6E, 0x76, 0x80);
+static const int SR_BASE = 52, SR_GAP = 12, SR_TRACK = 1;
+static const int SR_ROLL_MS = 260, SR_SHIFT = 14;
+static char     s_srTitle[72] = "", s_srCount[8] = "";   // what the row drew last
+static char     s_srFromTitle[72] = "", s_srFromCount[8] = "";   // rolling out
+static uint32_t s_srRollAt = 0;
+static int8_t   s_srDir = 1;
+static bool     s_srRolling = false, s_srTitleRolls = false, s_srCountRolls = false;
+static float    s_srK = 0;          // k the row was drawn with (0 = not drawn)
+static uint32_t s_srAt = 0;         // millis() of that frame
+
+// The age guard only has to outlive one slow loop pass (a first card-glyph
+// load, a file push's 250 ms drain): touchPoll runs before the frame, and the
+// caller already checks that the face is the page on screen.
+bool faceSessRowShown() {
+  return s_srK > 0.03f && (int32_t)(millis() - s_srAt) < 1000;
+}
+
+// one 2.5 px round-capped stroke between two points
+static void srStroke(Arduino_Canvas* c, float x0, float y0, float x1, float y1,
+                     uint16_t col) {
+  const float th = 2.5f;
+  float dx = x1 - x0, dy = y1 - y0;
+  drawRotatedPill(c, (x0 + x1) / 2, (y0 + y1) / 2, sqrtf(dx * dx + dy * dy) + th,
+                  th, atan2f(dy, dx) * 57.29578f, col);
+}
+
+// ‹ (dir -1, tip at x 28) or › (dir +1, tip at x 452): half-height 7, 5 wide,
+// centred on the title's x-height (y 46), outside the backing
+static void srChevron(Arduino_Canvas* c, int dir, uint16_t col) {
+  const float y = 46, h = 7, w = 5;
+  float tip = dir < 0 ? 28 : 452, open = tip - dir * w;
+  srStroke(c, open, y - h, tip, y, col);
+  srStroke(c, tip, y, open, y + h, col);
+}
+
+static void drawSessRow(Arduino_Canvas* c, const FaceFrame& f, uint32_t t, float k) {
+  char count[8];
+  snprintf(count, sizeof(count), "%u/%u", (unsigned)(f.sessCur + 1), (unsigned)f.sessN);
+  const char* title = f.sessTitle ? f.sessTitle : "";
+  // a change since the last drawn frame starts a roll; a fresh row (first
+  // frame after it was impossible) just appears
+  bool tCh = s_srTitle[0] && strcmp(title, s_srTitle) != 0;
+  bool cCh = s_srCount[0] && strcmp(count, s_srCount) != 0;
+  if (tCh || cCh) {
+    strlcpy(s_srFromTitle, s_srTitle, sizeof(s_srFromTitle));
+    strlcpy(s_srFromCount, s_srCount, sizeof(s_srFromCount));
+    s_srRollAt = t;
+    s_srDir = f.sessDir < 0 ? -1 : 1;
+    s_srTitleRolls = tCh;
+    s_srCountRolls = cCh;
+    s_srRolling = true;
+  }
+  strlcpy(s_srTitle, title, sizeof(s_srTitle));
+  strlcpy(s_srCount, count, sizeof(s_srCount));
+
+  int wt = almanacTextWidthSmallTrack(title, SR_TRACK);
+  int wc = almanacTextWidthSmallTrack(count, SR_TRACK);
+  int x0 = 240 - (wt + SR_GAP + wc) / 2;
+  uint16_t titleCol = dim565(SR_TITLE, k);
+  uint16_t cBase = f.sessQueue ? GREEN : SR_DIM;
+  int32_t age = (int32_t)(t - s_srRollAt);
+  if (s_srRolling && age >= SR_ROLL_MS) s_srRolling = false;
+
+  if (s_srRolling) {
+    float e = ease(age / (float)SR_ROLL_MS);
+    // the old line leaves from ITS OWN centred position, so a long old title
+    // never shows under the new counter
+    int wtO = almanacTextWidthSmallTrack(s_srFromTitle, SR_TRACK);
+    int wcO = almanacTextWidthSmallTrack(s_srFromCount, SR_TRACK);
+    int x0O = 240 - (wtO + SR_GAP + wcO) / 2;
+    // backing grows to y 20..72 and the wider of the two lines while both move
+    int bw = max(wt + SR_GAP + wc, wtO + SR_GAP + wcO);
+    c->fillRoundRect(240 - bw / 2 - 8, 20, bw + 16, 52, 8, BG);
+    int yOld = SR_BASE - (int)lroundf(SR_SHIFT * e) * s_srDir;
+    int yNew = SR_BASE + (int)lroundf(SR_SHIFT * (1 - e)) * s_srDir;
+    float kOld = k * (1 - e), kNew = k * e;
+    if (s_srTitleRolls) {
+      almanacPrintSmallTrack(c, x0O, yOld, s_srFromTitle, dim565(SR_TITLE, kOld), SR_TRACK);
+      almanacPrintSmallTrack(c, x0, yNew, title, dim565(SR_TITLE, kNew), SR_TRACK);
+    } else {
+      almanacPrintSmallTrack(c, x0, SR_BASE, title, titleCol, SR_TRACK);
+    }
+    if (s_srCountRolls) {
+      almanacPrintSmallTrack(c, x0O + wtO + SR_GAP, yOld, s_srFromCount, dim565(cBase, kOld), SR_TRACK);
+      almanacPrintSmallTrack(c, x0 + wt + SR_GAP, yNew, count, dim565(cBase, kNew), SR_TRACK);
+    } else {
+      almanacPrintSmallTrack(c, x0 + wt + SR_GAP, SR_BASE, count, dim565(cBase, k), SR_TRACK);
+    }
+  } else {
+    c->fillRoundRect(x0 - 8, SR_BASE - 24, wt + SR_GAP + wc + 16, 36, 8, BG);
+    almanacPrintSmallTrack(c, x0, SR_BASE, title, titleCol, SR_TRACK);
+    almanacPrintSmallTrack(c, x0 + wt + SR_GAP, SR_BASE, count, dim565(cBase, k), SR_TRACK);
+  }
+  // the pressed one lights up for 300 ms (main times it)
+  uint16_t dimC = dim565(SR_DIM, 0.9f * k), litC = dim565(EYE, k);
+  srChevron(c, -1, f.sessLit < 0 ? litC : dimC);
+  srChevron(c, +1, f.sessLit > 0 ? litC : dimC);
+}
+
 void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   const AgentDef& A = AGENTS[f.agentIdx];
   uint16_t accent = A.color;
@@ -778,16 +898,40 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   static bool prevStInit = false;
   if (!prevStInit) { memset(prevSt, 255, sizeof(prevSt)); prevStInit = true; }
   static bool prevOff = false;
+  bool resurface = false;
   if (f.agentIdx != lastIdx) {
     lastIdx = f.agentIdx;
-    switchT = t;
+    resurface = true;
     faceResetVariants();     // new seat, new pet: start its pool on V0
   }
   if (memcmp(prevSt, f.agentStates, sizeof(prevSt)) != 0) {
     memcpy(prevSt, f.agentStates, sizeof(prevSt));
+    resurface = true;
+  }
+  if (f.offline != prevOff) { prevOff = f.offline; resurface = true; }
+  // toast pinned on a nudge (tap / pick-up / PWR tap) or while the selected
+  // agent needs you (with ≥2 Claude sessions: the CURRENT session; main
+  // swaps it into agentStates[agentIdx])
+  bool hold = f.nudge ||
+              (!f.offline && !f.listening &&
+               f.agentStates[f.agentIdx] == ST_NEEDS_YOU);
+  // the current session (or the count) moved — the session row gets
+  // its 3 s again, but CONTINUING from where its fade is: a tap on a row that
+  // is showing must not dip it to black and fade it back in. The snap-to-zero
+  // restart above stays for everything else, so one session = today's face.
+  static uint16_t lastSessGen = 0;
+  bool sessMoved = f.sessGen != lastSessGen;
+  lastSessGen = f.sessGen;
+  if (sessMoved && f.sessN >= 2) {
+    float kNow = hold ? 1.0f : toastAgeK((int32_t)(t - switchT));
+    switchT = kNow >= 1.0f ? t - 250 : kNow > 0.03f ? t - (uint32_t)(kNow * 250) : t;
+  } else if (resurface) {
     switchT = t;
   }
-  if (f.offline != prevOff) { prevOff = f.offline; switchT = t; }
+  if (f.sessN < 2) {         // no row possible: the next one appears, never rolls in
+    s_srTitle[0] = s_srCount[0] = 0;
+    s_srRolling = false;
+  }
 
   // track "working continuously since" for the sweat easter egg
   static bool wasWorking = false;
@@ -799,13 +943,11 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   c->fillScreen(BG);
   // toast: fade in 250 ms, hold, fade out over the last 400 ms; pinned
   // on a nudge (tap / pick-up / PWR tap) or while the selected agent needs
-  // you. The dots alone also stay pinned while a background agent is
-  // working/needs/done — a Qoder task must stay visible from the claude
-  // seat, not flash for 3 s.
+  // you (`hold`, above). The dots alone also stay pinned while a background
+  // agent is working/needs/done — a Qoder task must stay visible from the
+  // claude seat, not flash for 3 s. The session row shares `k`.
+  float toastK;
   {
-    bool hold = f.nudge ||
-                (!f.offline && !f.listening &&
-                 f.agentStates[f.agentIdx] == ST_NEEDS_YOU);
     bool bgActive = false;
     if (!f.offline && !f.listening)
       for (int i = 0; i < N_AGENTS; i++)
@@ -813,16 +955,10 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
                                 f.agentStates[i] == ST_NEEDS_YOU ||
                                 f.agentStates[i] == ST_DONE))
           bgActive = true;
-    int32_t age = (int32_t)(t - switchT);
-    float k = 0.0f;
-    if (hold) k = 1.0f;
-    else if (age < 3000) {
-      k = 1.0f;
-      if (age < 250)       k = age / 250.0f;
-      else if (age > 2600) k = (3000 - age) / 400.0f;
-    }
+    float k = hold ? 1.0f : toastAgeK((int32_t)(t - switchT));
     float kDots = (hold || bgActive) ? 1.0f : k;
     if (k > 0.03f || kDots > 0.03f) drawToast(c, f, t, k, kDots);
+    toastK = k;
   }
   drawLowBatt(c, f, t);
   drawSkinProps(c, t);
@@ -956,7 +1092,7 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
       c->setTextColor(EYE);
       c->setCursor(362, qy);
       c->print("?");
-      if (f.sendK <= 0.03f && f.claimK <= 0.03f) drawApproveBubble(c, t);
+      if (f.sendK <= 0.03f && f.claimK <= 0.03f && !f.hideBubble) drawApproveBubble(c, t);
       break;
     }
     case ST_DONE: {                                  // happy closed arcs, bouncing
@@ -974,6 +1110,13 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
       break;
     }
   }
+
+  // Claude 多会话 top row: after the head props and eyes so its black
+  // backing covers the bunny's ear tip; same k as the bottom line
+  bool rowUp = f.sessN >= 2 && toastK > 0.03f;
+  if (rowUp) drawSessRow(c, f, t, toastK);
+  s_srK = rowUp ? toastK : 0.0f;
+  s_srAt = millis();
 
   if (f.pinVis) drawPin(c, f);
   if (f.volK > 0.03f) drawVolume(c, f);

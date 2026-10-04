@@ -33,6 +33,7 @@ Expected. The board does not pair with macOS; the host connects to it directly.
 - `AgentPetHost.app` needs the **Accessibility** permission to raise windows and press keys.
 - `curl -s http://127.0.0.1:8788/test/front` shows which app the host thinks is in front and which one it would raise. Fix the seat's app in the settings page under **Seats**.
 - Dictation needs an input method that dictates while fn is held.
+- Several Claude Code windows: `curl -s http://127.0.0.1:8788/test/sess/list` lists the sessions the host sees and how it reaches each tab (`adapter`; `app` means only the app). If you said no when asked whether `AgentPetHost` may control Terminal, iTerm2 or Ghostty, turn it on under System Settings → Privacy & Security → Automation. The hooks send terminal details only after `host/setup.sh` has run again.
 
 ### A Claude Code seat never changes state
 

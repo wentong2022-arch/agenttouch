@@ -33,6 +33,7 @@
 - `AgentPetHost.app` 要有**辅助功能**权限，才能拉前台窗口、替你按键。
 - `curl -s http://127.0.0.1:8788/test/front` 会显示 host 认为谁在前台、它会拉起哪个 app。在设置页「席位」里改对应的 app。
 - 听写需要一个按住 fn 就能语音输入的输入法。
+- 同时开几个 Claude Code 窗口时：`curl -s http://127.0.0.1:8788/test/sess/list` 列出 host 看到的会话，以及它怎么跳到每个标签页（`adapter`；`app` 表示只能拉起 app）。如果系统问「是否允许 `AgentPetHost` 控制终端 / iTerm2 / Ghostty」时你点了不允许，到「系统设置 → 隐私与安全性 → 自动化」里打开。hooks 要在重跑一次 `host/setup.sh` 之后才会带上终端信息。
 
 ### Claude Code 席位状态一直不变
 

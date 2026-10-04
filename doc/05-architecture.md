@@ -80,6 +80,8 @@ Host to board:
 | `fbeg` `fdat` `fend`, `fls`, `fcat`, `frm` | Write a file to the card (size and CRC32 checked), list, read, delete. TCP or USB. |
 | `ota` | Flash a firmware file from the card, or roll back. |
 | `shot`, `sd?`, `rtc?` | Ask for a screenshot (TCP or USB); ask about the card and the hardware clock. |
+| `sess` | The Claude seat's sessions (`cur` and a `list` of `id`, `ti` title, `dir` folder, `st`); an empty list below two sessions. |
+| `toast` | A one-line pill; `k:"mac_approve"` = "approve on the Mac". |
 
 Board to host:
 
@@ -90,7 +92,8 @@ Board to host:
 | `select` | The user switched seats. `src:"host"` echoes a host `select`; `src:"auto"` means the board left a seat that went off. |
 | `voice` | Right key down or up (`a`), with the seat, `to:"front"` when not on the face page, and whether board-mic audio follows. |
 | `mic`, `micstat` | Board-mic audio (IMA ADPCM, 40 ms per line) and end-of-session stats. |
-| `key` | `k:"approve"` or `"reject"` from the approve bubble; `k:"enter"` from the send bubble. |
+| `key` | `k:"approve"` or `"reject"` from the approve bubble; `k:"enter"` from the send bubble. With several Claude sessions `key` and `voice` carry `sid`, the session shown. |
+| `sess_sel` | The user tapped a half of the session row: the `id` now shown. |
 | `media`, `np_miss` | Play-page buttons for the Mac's player; a cover missing from the card. |
 | `qian` | The almanac was tapped: read the fortune aloud. |
 | `skins`, `owner`, `released` | Who wears which skin; `owner` answers `hostinfo` / `claim`; `released` tells the previous owner it was replaced. |
@@ -186,6 +189,10 @@ Hooks in `~/.claude/settings.json` POST each event to `http://127.0.0.1:8788/hoo
 
 - An interrupted turn sends no `Stop`. The host spots the interrupt marker in the session transcript and goes back to `idle`.
 - With several sessions the strongest wins: `needs_you` > `working` > `done` > `idle`. No session but a `claude` process means `idle`; neither means `off`.
+
+**Several sessions.** The hook command also sends headers: the claude PID (`$PPID` of the hook shell), its tty, `TERM_PROGRAM`, the terminal's bundle id, `WARP_FOCUS_URL` and `ITERM_SESSION_ID`. A session without them (started before the hooks changed) is matched to the one `claude` process in its folder, and its environment read with `ps eww`. Only sessions with a tty are listed; one whose process exits leaves at once; the list is saved to `~/.agentpet/claude_sessions.json` so a host restart keeps it. Each session's title is the latest `ai-title` line of its transcript.
+
+To bring a session's tab forward the host uses `open <WARP_FOCUS_URL>` in Warp, AppleScript by tty in Terminal (read back and retried once), by session id in iTerm2, by working directory and title in Ghostty, and `open -b <bundle>` anywhere else. The Warp variables are trusted only when `TERM_PROGRAM` says Warp: anything started from a Warp shell inherits them. Approve, reject, the send bubble's Return, face-page dictation and a board seat switch all land in the session the board shows; an approve for a session that is no longer waiting is dropped. `curl -s http://127.0.0.1:8788/test/sess/list` shows the table.
 
 ### Codex
 

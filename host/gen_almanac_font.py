@@ -88,6 +88,7 @@ def collect_charsets():
     body.update(chr(c) for c in range(0x20, 0x7F))          # ASCII
     body.update("「」·。，、！？；：…～—％")
     body.update("黄历同步中信号发送批准长按拒绝今日战报皮肤亮度")  # pages/face
+    body.update("请在上")                                  # 「请在 Mac 上批准」 toast
     body.update("连到这台接已还没有主人现在跟着")          # claim card
     body = sorted(c for c in body if ord(c) >= 0x20)
     header = sorted(set("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥"

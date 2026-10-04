@@ -686,6 +686,50 @@ bool almanacHasAll(const char* s) {
   return true;
 }
 
+// Claude 多会话 top row (face.cpp): tiny18 with +track px between
+// glyphs, the canvas's "+1 px 字距". Printed on pure black (the row's backing
+// is #000), so afPrintTrack's BG blend is the right one.
+int almanacPrintSmallTrack(Arduino_Canvas* c, int x, int baseline, const char* s,
+                           uint16_t fg, int track) {
+  return *s ? afPrintTrack(c, AF_TINY, x, baseline, s, fg, track) : x;
+}
+int almanacTextWidthSmallTrack(const char* s, int track) {
+  return afWidthTrack(AF_TINY, s, track);
+}
+// The canvas's fit(): the whole string when it is ≤ maxW wide, else the
+// longest prefix whose "prefix…" stays within maxW - 8. Tracking counted, so
+// a 300 px fit really ends at 300 px (afFit measures without it).
+void almanacFitSmallTrack(char* out, size_t n, const char* s, int maxW, int track) {
+  if (n < 8) { if (n) out[0] = 0; return; }
+  if (afWidthTrack(AF_TINY, s, track) <= maxW) { utf8Copy(out, n, s); return; }
+  int budget = maxW - 8 - afWidth(AF_TINY, "…") - track;   // prefix + gap + "…"
+  int w = 0, glyphs = 0;
+  size_t cut = 0;
+  for (const char* p = s; *p;) {
+    const uint8_t* g = afGlyph(AF_TINY, afDecode(p));
+    int nw = w + (glyphs ? track : 0) + (g ? g[2] : 19);
+    if (nw > budget) break;
+    w = nw; glyphs++;
+    cut = (size_t)(p - s);
+  }
+  if (cut > n - 4) cut = n - 4;
+  while (cut && ((uint8_t)s[cut] & 0xC0) == 0x80) cut--;   // never half a glyph
+  memcpy(out, s, cut);
+  out[cut] = 0;
+  strlcat(out, "…", n);
+}
+// Every glyph drawable in tiny18 (flash or card), and no 4-byte UTF-8 (emoji):
+// afDecode is BMP-only and would print one "?" per byte of it.
+bool almanacHasAllSmall(const char* s) {
+  for (const char* p = s; *p;) {
+    uint8_t b = (uint8_t)*p;
+    if (b >= 0x80 && (b >> 5) != 6 && (b >> 4) != 14) return false;
+    uint32_t cp = afDecode(p);
+    if (cp >= 0x80 && !afGlyph(AF_TINY, cp)) return false;
+  }
+  return true;
+}
+
 // Two lines: the first breaks where the next glyph would overflow (after the
 // last space if the break falls inside a Latin word), the second is fitted
 // with an ellipsis. Returns the number of lines used (1 or 2).

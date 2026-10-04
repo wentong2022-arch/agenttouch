@@ -47,10 +47,21 @@ struct FaceFrame {
   // claim card: a Mac asks
   // to become the owner; tap the green button = yes
   float      claimK;          // card opacity, 0 = hidden
+  bool       hideBubble;      // mac_approve pill is standing in for the approve bubble
   float      claimLeft;       // countdown bar, 1 -> 0 over 30 s
   bool       claimDone;       // accepted: solid green 「已连接」
   const char* claimName;      // fitted Mac name (body26)
   const char* claimSub;       // 「现在跟着…」/「还没有主人」, fitted (tiny18)
+  // Claude 多会话 top row:
+  // sessN < 2 = no row at all — one session draws exactly the face of before.
+  // main only fills these while the seat on screen owns the session list.
+  uint8_t    sessN;           // sessions in the list (≤ 8)
+  uint8_t    sessCur;         // 0-based index of the current one -> 「n/N」
+  const char* sessTitle;      // its label, already fitted to 300 px (tiny18 +1)
+  bool       sessQueue;       // counter green: current waits and another waits too
+  int8_t     sessDir;         // roll of the latest change: +1 up, -1 down
+  int8_t     sessLit;         // chevron being pressed: -1 ‹, +1 ›, 0 none
+  uint16_t   sessGen;         // bumps when the current session or the count moves
 };
 
 // Skins: same soul, different body. Affects eye shape + head props everywhere
@@ -76,3 +87,6 @@ int faceSettingsHit(int x, int y);
 // Claim card, in the face page's VIEW frame: 1 = the connect button,
 // 0 = elsewhere on the card (no-op), -1 = outside the card.
 int faceClaimHit(int x, int y);
+// Claude 多会话: true while the last face frame (< 1 s ago) drew
+// the session row with k > 0.03 — the top band only switches sessions then.
+bool faceSessRowShown();

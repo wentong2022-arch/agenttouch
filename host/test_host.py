@@ -249,7 +249,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(H.board_rtc_boot, 1788899000)
         kinds = [json.loads(r)["t"] for r in self.replies]
         # a TCP hello is first told who we are (认领制: IP drift, first owner)
-        self.assertEqual(kinds, ["hostinfo", "time", "almanac", "report", "cfg"])
+        # ... and the Claude session row last (empty with no sessions)
+        self.assertEqual(kinds, ["hostinfo", "time", "almanac", "report", "cfg", "sess"])
         tm = json.loads(self.replies[1])
         self.assertAlmostEqual(tm["epoch"], before, delta=5)      # UTC seconds ...
         self.assertEqual(tm["off"], time.localtime().tm_gmtoff)   # ... plus the host's tz offset
@@ -912,7 +913,7 @@ class VoiceToFrontTests(unittest.TestCase):
         H._voice_to_front = True
         decided = []
         saved = H.decision_key
-        H.decision_key = decided.append
+        H.decision_key = lambda k, sid=None: decided.append(k)
         try:
             H.handle_board_msg(json.dumps({"t": "key", "k": "approve"}), lambda b: None)
             H.handle_board_msg(json.dumps({"t": "key", "k": "reject", "to": "front"}),
@@ -4378,6 +4379,201 @@ class OwnerTests(unittest.TestCase):
         for ep in ('"/board/owner"', '"/board/claim"'):
             self.assertIn(ep, src)
         self.assertIn('"owner": owner_snapshot()', src)
+
+
+class ClaudeSessionTests(unittest.TestCase):
+    """several Claude Code terminals — the board's session row and the
+    session-exact routing behind it. Nothing here raises a window or types."""
+
+    def setUp(self):
+        self._saved = dict(H.claude_sessions)
+        H.claude_sessions.clear()
+        self._inject = mock.patch.object(H, "inject", lambda fn: None)
+        self._push = mock.patch.object(H, "push_raw", lambda msg: None)
+        self._inject.start()
+        self._push.start()
+
+    def tearDown(self):
+        self._inject.stop()
+        self._push.stop()
+        H.claude_sessions.clear()
+        H.claude_sessions.update(self._saved)
+
+    def test_headers_become_session_fields(self):
+        meta = H.sess_meta_from_headers({
+            "X-AT-Pid": "4711", "X-AT-Tty": "ttys003 ", "X-AT-Term": "WarpTerminal",
+            "X-AT-Bundle": "dev.warp.Warp-Stable", "X-AT-Warp": "warp://session/abc",
+            "X-AT-Iterm": ""})
+        self.assertEqual(meta, {"hpid": 4711, "tty": "/dev/ttys003", "term": "WarpTerminal",
+                                "bundle": "dev.warp.Warp-Stable", "warp": "warp://session/abc"})
+        self.assertEqual(H.sess_meta_from_headers({"X-AT-Pid": "x1", "X-AT-Tty": "??"}), {})
+
+    def test_adapter_per_terminal(self):
+        A = H.sess_adapter
+        self.assertEqual(A({"term": "WarpTerminal", "warp": "warp://session/1f", "tty": "/dev/ttys1"}),
+                         ("warp", "warp://session/1f"))
+        self.assertEqual(A({"term": "Apple_Terminal", "tty": "/dev/ttys004", "bundle": "com.apple.Terminal"}),
+                         ("terminal", "/dev/ttys004"))
+        self.assertEqual(A({"term": "iTerm.app", "iterm": "w0t1p0:ABC-123"}), ("iterm", "ABC-123"))
+        self.assertEqual(A({"term": "ghostty", "cwd": "/x/y"}), ("ghostty", "/x/y"))
+        self.assertEqual(A({"term": "vscode", "bundle": "com.microsoft.VSCode"}),
+                         ("app", "com.microsoft.VSCode"))
+        self.assertEqual(A({}), (None, None))
+        # Warp's URL is inherited by anything started from a Warp shell: a
+        # Terminal.app session carrying it is still a Terminal.app session
+        self.assertEqual(A({"term": "Apple_Terminal", "tty": "/dev/ttys2",
+                            "warp": "warp://session/cad1"}), ("terminal", "/dev/ttys2"))
+        self.assertEqual(A({"term": "tmux", "warp": "warp://session/cad1"}),
+                         ("warp", "warp://session/cad1"))
+
+    def test_title_from_transcript_tail(self):
+        tail = ('{"type":"ai-title","aiTitle":"Old name"}\n'
+                '{"type":"user","message":{"content":"ai-title in text"}}\n'
+                '{"type":"ai-title","aiTitle":"✳ Claude Code 多终端窗口管理","sessionId":"s"}\n'
+                '{"type":"ai-title","aiTi')          # cut-off last line
+        self.assertEqual(H.sess_title_from_tail(tail), "Claude Code 多终端窗口管理")
+        self.assertIsNone(H.sess_title_from_tail('{"type":"user"}\n'))
+
+    def test_folder_labels_number_duplicates(self):
+        recs = {"a": {"cwd": "/p/esptouch"}, "b": {"cwd": "/q/05-VibeWriter"},
+                "c": {"cwd": "/p/esptouch"}, "d": {}}
+        self.assertEqual(H.sess_dir_labels(["a", "b", "c", "d"], recs),
+                         {"a": "esptouch", "b": "05-VibeWriter", "c": "esptouch·2", "d": "claude"})
+
+    def test_policy(self):
+        P = H.sess_policy
+        order = ["a", "b", "c", "d"]
+        idle = {s: "idle" for s in order}
+        act = {"a": 1, "b": 5, "c": 2, "d": 3}
+        # a fresh list shows the most recently active session
+        self.assertEqual(P(order, [], idle, {}, None, {}, act, 0, 100)[0], "b")
+        # a request in another session jumps there (and the Mac should follow)
+        st = dict(idle, c="needs_you")
+        self.assertEqual(P(order, order, st, idle, "a", {"c": 99}, act, 0, 100), ("c", 0.0, "c"))
+        # a second request while the current one waits: stay (first come, first answered)
+        st2 = dict(st, d="needs_you")
+        self.assertEqual(P(order, order, st2, st, "c", {"c": 99, "d": 100}, act, 0, 101)[:2], ("c", 0.0))
+        # answered: hand over 0.7 s later, not at once
+        st3 = dict(st2, c="working")
+        cur, relay, jumped = P(order, order, st3, st2, "c", {"d": 100}, act, 0, 102)
+        self.assertEqual((cur, jumped), ("c", None))
+        self.assertAlmostEqual(relay, 102 + H.SESS_RELAY_S)
+        self.assertEqual(P(order, order, st3, st3, "c", {"d": 100}, act, relay, 102.8), ("d", 0.0, "d"))
+        # typing in a tab on the Mac moves the board there
+        self.assertEqual(P(order, order, idle, idle, "a", {}, act, 0, 100, typed="d")[0], "d")
+        # the current session ends: the one after it, or before it at the end
+        self.assertEqual(P(["a", "c", "d"], order, idle, idle, "b", {}, act, 0, 100)[0], "c")
+        self.assertEqual(P(["a", "b", "c"], order, idle, idle, "d", {}, act, 0, 100)[0], "c")
+        self.assertEqual(P([], order, {}, idle, "a", {}, {}, 0, 100), (None, 0.0, None))
+
+    def test_board_line(self):
+        recs = {}
+        one = H.sess_build_msg(["a"], recs, {"a": "idle"}, "a", {}, {})
+        self.assertEqual(one["list"], [])               # one session: the board draws nothing
+        long = "题" * 40                                 # 120 bytes of UTF-8
+        m = H.sess_build_msg(["aaaaaaaa-1", "bbbbbbbb-2"], recs,
+                             {"aaaaaaaa-1": "working", "bbbbbbbb-2": "needs_you"},
+                             "bbbbbbbb-2", {"aaaaaaaa-1": long}, {"aaaaaaaa-1": "esptouch"})
+        self.assertEqual(m["cur"], "bbbbbbbb")
+        self.assertEqual([i["id"] for i in m["list"]], ["aaaaaaaa", "bbbbbbbb"])
+        self.assertLessEqual(len(m["list"][0]["ti"].encode()), H.SESS_TITLE_MAX)
+        self.assertTrue(long.startswith(m["list"][0]["ti"]))
+        self.assertEqual(m["list"][1], {"id": "bbbbbbbb", "ti": "", "dir": "", "st": "needs_you"})
+        order = ["s%02d" % i for i in range(11)]
+        m = H.sess_build_msg(order, recs, {}, "s00", {}, {})
+        ids = [i["id"] for i in m["list"]]
+        self.assertEqual(len(ids), H.SESS_MAX)
+        self.assertIn("s00", ids)
+        self.assertEqual(ids, sorted(ids))
+
+    def test_approve_plan(self):
+        now = 1000.0
+        warp = {"pid": 1, "tty": "/dev/ttys1", "warp": "warp://session/a", "state": "needs_you",
+                "needs_since": 5, "ts": now}
+        code1 = {"pid": 2, "tty": "/dev/ttys2", "bundle": "com.microsoft.VSCode", "state": "needs_you",
+                 "needs_since": 3, "ts": now}
+        code2 = dict(code1, pid=3, tty="/dev/ttys3", state="idle")
+        S = {"aaaa1111": warp, "bbbb2222": code1, "cccc3333": code2}
+        self.assertEqual(H.approve_plan("aaaa1111", S, now), ("go", "aaaa1111"))
+        self.assertEqual(H.approve_plan("cccc3333", S, now), ("drop", "cccc3333"))   # not waiting
+        self.assertEqual(H.approve_plan("dddd4444", S, now), ("drop", None))         # gone
+        self.assertEqual(H.approve_plan("bbbb2222", S, now), ("refuse", "bbbb2222")) # 2 in VS Code
+        self.assertEqual(H.approve_plan(None, S, now), ("refuse", "bbbb2222"))       # oldest request
+        self.assertEqual(H.approve_plan(None, {"aaaa1111": warp}, now), ("go", "aaaa1111"))
+        self.assertEqual(H.approve_plan(None, {"aaaa1111": dict(warp, state="idle")}, now),
+                         ("legacy", None))
+        self.assertEqual(H.approve_plan(None, {"x": {"state": "needs_you"}}, now), ("legacy", None))
+
+    def test_hook_records_terminal_and_requests(self):
+        H.claude_hook("UserPromptSubmit", {"session_id": "s-1", "cwd": "/p/esptouch",
+                                           "transcript_path": "/t/s-1.jsonl"},
+                      {"hpid": 4242, "tty": "/dev/ttys009", "warp": "warp://session/z"})
+        s = H.claude_sessions["s-1"]
+        self.assertEqual((s["cwd"], s["hpid"], s["tty"], s["warp"], s["state"]),
+                         ("/p/esptouch", 4242, "/dev/ttys009", "warp://session/z", "working"))
+        H.claude_hook("Notification", {"session_id": "s-1", "message": "Claude needs your permission"})
+        first = H.claude_sessions["s-1"]["needs_since"]
+        H.claude_hook("Notification", {"session_id": "s-1", "message": "Claude needs your permission"})
+        self.assertEqual(H.claude_sessions["s-1"]["needs_since"], first)   # not reset by a repeat
+
+    def test_dead_process_leaves_at_once(self):
+        now = time.time()
+        H.claude_sessions["gone"] = {"state": "working", "ts": now, "done_until": 0, "pid": 999999}
+        H.claude_sessions["here"] = {"state": "idle", "ts": now, "done_until": 0, "pid": os.getpid()}
+        H.aggregate()
+        self.assertNotIn("gone", H.claude_sessions)
+        self.assertIn("here", H.claude_sessions)
+
+    def test_reverse_follow_takes_any_session_terminal(self):
+        self.assertEqual(H.front_agent("iTerm2|iTerm", {"claude": ("Warp", "iTerm")}), "claude")
+        self.assertEqual(H.front_agent("Warp|Warp", {"claude": ("Warp", "iTerm")}), "claude")
+        self.assertIsNone(H.front_agent("Safari|Safari", {"claude": ("Warp", "iTerm")}))
+        # only terminals we can aim at a tab claim the seat: a session in a
+        # VS Code terminal must not make every VS Code click switch seats
+        now = time.time()
+        H.claude_sessions["w"] = {"pid": 1, "tty": "/dev/ttys1", "ts": now,
+                                  "warp": "warp://session/1", "bundle": "dev.warp.Warp-Stable"}
+        H.claude_sessions["v"] = {"pid": 2, "tty": "/dev/ttys2", "ts": now,
+                                  "bundle": "com.microsoft.VSCode"}
+        with mock.patch.dict(H._bundle_names, {"dev.warp.Warp-Stable": "Warp",
+                                               "com.microsoft.VSCode": "Visual Studio Code"}):
+            self.assertEqual(H.sess_term_apps(), {"Warp"})
+
+    def test_fake_row_never_routes_to_a_real_tab(self):
+        now = time.time()
+        H.claude_sessions["real-1"] = {"pid": 1, "tty": "/dev/ttys1", "ts": now}
+        with mock.patch.dict(H._sess_fake, {"msg": {"t": "sess"}, "until": now + 30}), \
+                mock.patch.object(H, "sess_cur", "real-1"):
+            self.assertIsNone(H.sess_for_action("f0000001"))
+            self.assertIsNone(H.sess_for_action())
+        with mock.patch.object(H, "sess_cur", "real-1"):
+            self.assertEqual(H.sess_for_action(), "real-1")
+
+    def test_table_survives_a_restart_but_not_a_dead_process(self):
+        now = time.time()
+        d = tempfile.mkdtemp()
+        with mock.patch.object(H, "SESS_FILE", Path(d) / "s.json"), \
+                mock.patch.object(H, "_claude_pid_up", lambda pid: pid), \
+                mock.patch.dict(H._sess_saved, {"sig": None, "at": 0.0}):
+            H.claude_sessions["live"] = {"state": "idle", "ts": now, "pid": os.getpid(),
+                                         "tty": "/dev/ttys1", "title": "T"}
+            H.claude_sessions["dead"] = {"state": "idle", "ts": now, "pid": 999999,
+                                         "tty": "/dev/ttys2"}
+            H.claude_sessions["nopid"] = {"state": "idle", "ts": now}
+            H.sess_save(now)
+            H.claude_sessions.clear()
+            H.sess_load()
+            self.assertEqual(set(H.claude_sessions), {"live"})
+            self.assertEqual(H.claude_sessions["live"]["title"], "T")
+
+    def test_hook_command_sends_terminal_headers(self):
+        sys.path.insert(0, str(HERE))
+        import install_hooks
+        c = install_hooks.cmd("PreToolUse")
+        for h in ("X-AT-Pid: $PPID", "X-AT-Tty:", "X-AT-Warp: $WARP_FOCUS_URL", "X-AT-Bundle:"):
+            self.assertIn(h, c)
+        self.assertTrue(c.endswith("|| true"))
+        self.assertIn("src=agentpet", c)
 
 
 if __name__ == "__main__":

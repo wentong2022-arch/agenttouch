@@ -80,6 +80,8 @@ host → 板子：
 | `fbeg` `fdat` `fend`、`fls`、`fcat`、`frm` | 往卡上写文件（校验大小和 CRC32）、列目录、读、删。走 TCP 或 USB。 |
 | `ota` | 用卡上的固件文件刷机，或回滚。 |
 | `shot`、`sd?`、`rtc?` | 要一张截图（TCP 或 USB）；问卡和硬件时钟的情况。 |
+| `sess` | Claude 席位的会话（`cur` 加 `list`：`id`、题目 `ti`、文件夹 `dir`、状态 `st`）；不到两个会话时列表为空。 |
+| `toast` | 一行药丸提示；`k:"mac_approve"` =「请在 Mac 上批准」。 |
 
 板子 → host：
 
@@ -90,7 +92,8 @@ host → 板子：
 | `select` | 用户切了席位。`src:"host"` 是回显 host 的 `select`；`src:"auto"` 表示板子离开了一个刚变 off 的席位。 |
 | `voice` | 右键按下或松开（`a`），带席位；不在脸页时带 `to:"front"`；以及后面是否跟着板麦音频。 |
 | `mic`、`micstat` | 板麦音频（IMA ADPCM，每行 40 ms）和会话结束时的统计。 |
-| `key` | 批准气泡发 `k:"approve"` 或 `"reject"`；发送气泡发 `k:"enter"`。 |
+| `key` | 批准气泡发 `k:"approve"` 或 `"reject"`；发送气泡发 `k:"enter"`。有几个 Claude 会话时，`key` 和 `voice` 带 `sid`，即板上显示的那个会话。 |
+| `sess_sel` | 用户点了会话行的一半：现在显示的 `id`。 |
 | `media`、`np_miss` | 播放页上控制 Mac 播放器的按键；卡上缺的封面。 |
 | `qian` | 黄历页被点了：念今日签文。 |
 | `skins`、`owner`、`released` | 谁穿哪套皮肤；`owner` 答复 `hostinfo` / `claim`；`released` 告诉原主人它被换掉了。 |
@@ -186,6 +189,10 @@ host/
 
 - 被打断的一轮不会发 `Stop`。host 在会话记录里看到打断标记，就回到 `idle`。
 - 多个会话取最强的：`needs_you` > `working` > `done` > `idle`。没有会话但有 `claude` 进程算 `idle`，都没有算 `off`。
+
+**几个会话。** hook 命令还带几个请求头：claude 的 PID（hook 所在 shell 的 `$PPID`）、它的 tty、`TERM_PROGRAM`、终端的 bundle id、`WARP_FOCUS_URL` 和 `ITERM_SESSION_ID`。没有这些头的会话（hook 改之前就开着的）按文件夹找到唯一的那个 `claude` 进程，用 `ps eww` 读它的环境。只列有 tty 的会话；进程一退出就移出；列表存在 `~/.agentpet/claude_sessions.json`，host 重启后还在。每个会话的题目取它会话记录里最后一条 `ai-title`。
+
+把某个会话的标签页拉到前台：Warp 用 `open <WARP_FOCUS_URL>`，系统终端用 AppleScript 按 tty 选中（读回一次，不对再试一次），iTerm2 按会话 id，Ghostty 按工作目录和标题，其余终端 `open -b <bundle>`。Warp 的变量只在 `TERM_PROGRAM` 是 Warp 时才信：从 Warp 里启动的任何东西都会继承它们。批准、拒绝、发送气泡的回车、脸页听写、板上切席位，都落到板上正显示的那个会话；已经不在等的会话收到的批准直接丢弃。`curl -s http://127.0.0.1:8788/test/sess/list` 可以看会话表。
 
 ### Codex
 

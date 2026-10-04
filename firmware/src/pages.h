@@ -58,6 +58,12 @@ bool almanacHasAll(const char* s);        // every glyph drawable (flash or card
 int almanacPrintSmall(Arduino_Canvas* c, int x, int baseline, const char* s,
                       uint16_t fg, uint16_t bg);
 int almanacTextWidthSmall(const char* s);
+// tiny18 with letter tracking, on black (Claude 多会话 top row)
+int almanacPrintSmallTrack(Arduino_Canvas* c, int x, int baseline, const char* s,
+                           uint16_t fg, int track);
+int almanacTextWidthSmallTrack(const char* s, int track);
+void almanacFitSmallTrack(char* out, size_t n, const char* s, int maxW, int track);
+bool almanacHasAllSmall(const char* s);   // tiny18 can draw every glyph (flash or card)
 void almanacSet(const char* gz, const char* sx, const char* jc, const char* date,
                 const char* yi0, const char* yi1, const char* ji0, const char* ji1,
                 const char* qian, const char* dir, int sig,

@@ -34,6 +34,7 @@ https://github.com/user-attachments/assets/155b532f-d46f-4f69-8415-f9d9466a5a21
 
 - **See what your agent is doing.** Idle, working, needs you, done: each has its own face. The board has five seats (Claude Code, Codex, Qoder IDE, QwenWork, Qoder desktop). Swipe to switch, and the Mac brings that agent to the front.
 - **Tap to approve.** When an agent asks for permission, the board jumps to its face with an Approve bubble. Tap to approve, hold to reject; the Mac presses the key for you.
+- **Several Claude Code windows.** With two or more open, a row on top of the face names the session it means; tap its halves to step through them. Approving and dictation go to that session's own terminal tab.
 - **Talk to it.** Hold the right key and speak. Your words land in the agent's input box; tap the screen to send.
 - **Six skins, one per seat.** classic, kitty, robo, bunny, sprout and grok, so switching agents switches characters.
 - **Turn it on its side.** A ring clock, what your Mac is playing, an on-board podcast player, a calendar and a Chinese almanac. Lay it face down and it sleeps.

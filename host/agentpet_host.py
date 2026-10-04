@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-01a"
+HOST_VERSION = "2026-10-04a"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -671,6 +671,10 @@ def focus_agent(agent):
         if not focus_should_raise(st):         # checked when the timer fires, not when queued
             log("focus follow:", agent, "is off, not launching", app)
             return
+        sid = sess_for_action() if agent == "claude" else None
+        if sid:                                # the session the board shows
+            focus_session(sid)
+            return
         r = subprocess.run(["open", "-a", app], capture_output=True, timeout=10)
         _focus_raised[agent] = host_raise_at = time.time()
         log("focus follow:", agent, "->", app,
@@ -847,9 +851,10 @@ def front_agent(front_str, apps=None):
     # both appear in one front string (2026-09-13), the specific one owns it
     best = None
     for agent, app in apps.items():
-        name = str(app or "").strip().lower()
-        if name and name in parts and (best is None or len(name) > len(best[1])):
-            best = (agent, name)
+        for name in (app if isinstance(app, (tuple, list, set)) else (app,)):
+            name = str(name or "").strip().lower()
+            if name and name in parts and (best is None or len(name) > len(best[1])):
+                best = (agent, name)
     return best[0] if best else None
 
 
@@ -891,7 +896,12 @@ def front_follow_tick():
         return
     with lock:
         cur = active_agent
-    agent = front_follow_decide(front_agent(front), cur, time.time(), _front_st,
+    apps = FOCUS_APPS
+    extra = sess_term_apps()
+    if extra:                            # Claude sessions in iTerm / Ghostty / ...
+        apps = dict(FOCUS_APPS)
+        apps["claude"] = tuple(sorted(extra | ({FOCUS_APPS["claude"]} if FOCUS_APPS.get("claude") else set())))
+    agent = front_follow_decide(front_agent(front, apps), cur, time.time(), _front_st,
                                 board_select_at, host_raise_at, voice_down, FOLLOW_FRONT)
     if not agent:
         return
@@ -956,11 +966,13 @@ def _inject_worker():
 
 threading.Thread(target=_inject_worker, daemon=True).start()
 
-def decision_key(kind):
+def decision_key(kind, sid8=None):
     # Board tap-to-approve / long-press-to-reject on a needs_you agent.
     agent = active_agent
     spec = (APPROVE_KEYS if kind == "approve" else REJECT_KEYS).get(agent)
     if not spec:
+        return
+    if agent == "claude" and claude_decision(kind, spec, sid8):
         return
 
     def go():
@@ -974,6 +986,41 @@ def decision_key(kind):
         with lock:
             codex_notify["perm_done"] = codex_notify.get("perm_call")
     inject(go)
+
+def claude_decision(kind, spec, sid8):
+    """Claude seat: the key goes to the session the board showed.
+    True = handled here (typed, dropped or refused); False = no session
+    info, take the old app-level path."""
+    with lock:
+        snap = {k: dict(v) for k, v in claude_sessions.items()}
+    plan, sid = approve_plan(sid8, snap, time.time())
+    if plan == "legacy":
+        return False
+    if plan == "drop":
+        log("decision:", kind, "dropped: session", (sid or str(sid8))[:8], "is not waiting")
+        return True
+    if plan == "refuse":
+        log("decision:", kind, "refused: two sessions in one app we cannot target")
+        push_board({"t": "toast", "k": "mac_approve"})
+        return True
+    want, _ = sess_adapter(snap[sid])
+
+    def go():
+        done = focus_session(sid)
+        if done is None or (done == "app" and want != "app"):
+            # the exact tab could not be reached (Automation refused?): with
+            # another listed session in that app, Enter could hit the wrong one
+            others = [s for s, v in snap.items() if s != sid and v.get("pid") and v.get("tty")
+                      and v.get("bundle") and v.get("bundle") == snap[sid].get("bundle")]
+            if done is None or others:
+                log("decision:", kind, "refused: could not reach", sid[:8], "exactly")
+                push_board({"t": "toast", "k": "mac_approve"})
+                return
+        time.sleep(0.4)                  # let the tab take the keyboard
+        post_key(spec)
+        log("decision:", kind, "claude", sid[:8], "via", done, "->", spec)
+    inject(go)
+    return True
 
 # ------------------------------------------------------------------ voice key
 try:
@@ -1511,6 +1558,755 @@ def claude_interrupted_after(path, since_ts, tail_bytes=16384):
         return t > since_ts
     return False
 
+# ------------------------------------------------------------------ Claude sessions
+# Several Claude Code terminals at once (2026-10-03, user). The seat still
+# shows ONE merged state (aggregate() below), but the board can now show
+# which session it means — a title row on top of the face, tap its halves to
+# step through the sessions — and every key the host types for the Claude
+# seat lands in THAT session's terminal tab, not in whatever tab of the app
+# happens to be in front (the old `open -a Warp` + Enter could approve into
+# the wrong tab, or send a half-typed line). Rule: what the board shows is
+# what you act on.
+#
+# Where a session lives: the hook sends the claude PID and its terminal's
+# identity as headers (install_hooks.py); a session that started before the
+# hooks changed sends none, so the claude process is found by its working
+# directory instead and its environment read with `ps eww`. Only sessions with
+# a tty are listed: `claude -p` / SDK runs still count in the seat state.
+SESS_MAX = 8                 # sessions sent to the board
+SESS_TITLE_MAX = 64          # bytes, cut on a character boundary (the board cuts by pixels)
+SESS_DIR_MAX = 32
+SESS_RELAY_S = 0.7           # an answered card hands over to the next waiting session (canvas)
+SESS_TITLE_EVERY_S = 5       # transcript re-read for a changed ai-title
+SESS_RESOLVE_EVERY_S = 20    # unresolved sessions: retry finding their process
+SESS_ENV_KEYS = ("TERM_PROGRAM", "__CFBundleIdentifier", "WARP_FOCUS_URL", "ITERM_SESSION_ID")
+_SESS_HDR = {"X-AT-Pid": "hpid", "X-AT-Tty": "tty", "X-AT-Term": "term",
+             "X-AT-Bundle": "bundle", "X-AT-Warp": "warp", "X-AT-Iterm": "iterm"}
+_SESS_ENV = {"TERM_PROGRAM": "term", "__CFBundleIdentifier": "bundle",
+             "WARP_FOCUS_URL": "warp", "ITERM_SESSION_ID": "iterm"}
+_CLAUDE_ARGS_RE = re.compile(r"(^|[/\s])claude(\s|$)")     # = PROC_RULES["claude"]
+
+sess_cur = None              # session_id the board shows for the Claude seat
+_sess_prev = {}              # sid -> session state at the last policy pass (edges)
+_sess_prev_order = []
+_sess_relay_at = 0.0         # pending hand-over time (0 = none)
+_sess_typed = None           # sid whose UserPromptSubmit came since the last pass
+_sess_last_line = None       # last sess line pushed (dedupe)
+_sess_fake = {"msg": None, "until": 0.0}   # /test/sess holds the board for screenshots
+_sess_focus_timer = None
+_sess_relay_timer = None
+_bundle_names = {}           # bundle id -> app name, for reverse follow
+_sess_front = {"sid": None}  # the session whose tab we last put in front (or typed in)
+
+
+SESS_FILE = Path.home() / ".agentpet" / "claude_sessions.json"
+_SESS_KEEP = ("state", "ts", "done_until", "started", "transcript", "cwd", "pid", "tty",
+              "term", "bundle", "warp", "iterm", "title", "needs_since")
+_sess_saved = {"sig": None, "at": 0.0}
+
+
+def sess_save(now):
+    """Keep the session table across host restarts (deploys, the 2 h no-board
+    self-restart): an idle session sends no hook, and without this it would
+    vanish from the board's row until it did. Listed sessions only; written
+    when membership / titles change, else at most every 30 s."""
+    with lock:
+        keep = {sid: {k: v[k] for k in _SESS_KEEP if k in v}
+                for sid, v in claude_sessions.items() if v.get("pid") and v.get("tty")}
+    sig = json.dumps(sorted((sid, v.get("pid"), v.get("title")) for sid, v in keep.items()),
+                     ensure_ascii=False)
+    if sig == _sess_saved["sig"] and now - _sess_saved["at"] < 30:
+        return
+    try:
+        tmp = SESS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(keep, ensure_ascii=False))
+        tmp.replace(SESS_FILE)
+        _sess_saved.update(sig=sig, at=now)
+    except OSError as e:
+        log("claude sessions: save failed:", e)
+
+
+def sess_load():
+    """At start-up: take back saved sessions whose claude process still runs
+    (and still IS claude: after a reboot the pid may be someone else's)."""
+    try:
+        saved = json.loads(SESS_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    now, n = time.time(), 0
+    for sid, v in (saved or {}).items():
+        pid = v.get("pid")
+        if not pid or now - v.get("ts", 0) > 6 * 3600 or not _pid_alive(pid) \
+                or _claude_pid_up(pid) != pid:
+            continue
+        with lock:
+            claude_sessions.setdefault(sid, dict(v, res_at=now))
+        n += 1
+    if n:
+        log("claude sessions: restored", n)
+
+
+def sess_meta_from_headers(headers):
+    """Hook request headers -> session fields. Values are trimmed; empty ones
+    dropped; the tty gets its /dev/ prefix ('??' = no terminal)."""
+    out = {}
+    for h, key in _SESS_HDR.items():
+        v = str(headers.get(h) or "").strip()
+        if not v:
+            continue
+        if key == "hpid":
+            if not v.isdigit():
+                continue
+            v = int(v)
+        elif key == "tty":
+            if v in ("??", "-"):
+                continue
+            v = v if v.startswith("/dev/") else "/dev/" + v
+        out[key] = v
+    return out
+
+
+def sess_adapter(rec):
+    """How to bring this session's tab to the front: (kind, arg).
+    warp/terminal/iterm/ghostty = that exact tab; app = the terminal app only;
+    (None, None) = nothing known (the caller falls back to focus_apps)."""
+    term = rec.get("term") or ""
+    warp = rec.get("warp") or ""
+    # TERM_PROGRAM is set by the terminal itself; the WARP_* variables are
+    # merely inherited — a Terminal.app opened from a Warp shell carries the
+    # Warp tab's URL (seen 2026-10-04), so trust it only inside Warp (or a
+    # tmux running in a Warp tab)
+    if warp.startswith("warp://session/") and term in ("WarpTerminal", "tmux", ""):
+        return "warp", warp
+    if term == "Apple_Terminal" and rec.get("tty"):
+        return "terminal", rec["tty"]
+    iterm = rec.get("iterm") or ""
+    if term == "iTerm.app" and ":" in iterm:
+        return "iterm", iterm.split(":", 1)[1]
+    if term == "ghostty" and rec.get("cwd"):
+        return "ghostty", rec["cwd"]
+    if rec.get("bundle"):
+        return "app", rec["bundle"]
+    return None, None
+
+
+def sess_state(v, now):
+    """One session's own state, by the same rules the seat merge uses."""
+    if v.get("state") == "needs_you":
+        return "needs_you"
+    if v.get("state") == "working" and now - v.get("ts", 0) < CLAUDE_WORK_DECAY:
+        return "working"
+    if v.get("done_until", 0) > now:
+        return "done"
+    return "idle"
+
+
+def sess_title_from_tail(text):
+    """Last ai-title in a transcript chunk, without Claude's '✳ ' marker."""
+    title = None
+    for line in text.splitlines():
+        if '"ai-title"' not in line:
+            continue
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue                      # the cut-off first line of a tail
+        t = str(m.get("aiTitle") or "").strip()
+        if t:
+            title = t
+    if title:
+        title = re.sub(r"^[✳*]\s*", "", title)
+    return title
+
+
+def sess_dir_labels(order, recs):
+    """sid -> folder label; the second session in the same folder gets '·2'."""
+    seen, out = {}, {}
+    for sid in order:
+        base = Path(str(recs.get(sid, {}).get("cwd") or "")).name or "claude"
+        seen[base] = seen.get(base, 0) + 1
+        out[sid] = base if seen[base] == 1 else f"{base}·{seen[base]}"
+    return out
+
+
+def utf8_cut(s, limit):
+    b = str(s or "").encode("utf-8")
+    if len(b) <= limit:
+        return str(s or "")
+    return b[:limit].decode("utf-8", "ignore")
+
+
+def sess_policy(order, prev_order, states, prev, cur, needs_since, activity,
+                relay_at, now, typed=None):
+    """Which session the board shows -> (cur, relay_at, jumped_to).
+    Pure (test_host.py). `jumped_to` is set only when a permission request
+    moved the board, i.e. when the Mac should follow at once (canvas: a
+    request jumps immediately; board taps wait for the hand to stop)."""
+    if not order:
+        return None, 0.0, None
+    if cur not in order:                  # current ended: the one after it, else before
+        nxt = None
+        if cur in prev_order:
+            i = prev_order.index(cur)
+            after = [s for s in prev_order[i + 1:] if s in order]
+            before = [s for s in prev_order[:i] if s in order]
+            nxt = after[0] if after else (before[-1] if before else None)
+        cur = nxt or max(order, key=lambda s: activity.get(s, 0))
+    if typed in order:                    # the user typed in that tab on the Mac
+        cur, relay_at = typed, 0.0
+    waiting = sorted((s for s in order if states.get(s) == "needs_you"),
+                     key=lambda s: needs_since.get(s, 0))
+    jumped = None
+    if states.get(cur) == "needs_you":
+        relay_at = 0.0                    # first come, first answered: stay put
+    else:
+        fresh = [s for s in waiting if prev.get(s) != "needs_you"]
+        if prev.get(cur) == "needs_you" and waiting:
+            relay_at = now + SESS_RELAY_S     # just answered: next one in 0.7 s
+        elif fresh:
+            cur, relay_at, jumped = fresh[0], 0.0, fresh[0]
+        elif relay_at and now >= relay_at:
+            if waiting:
+                cur = jumped = waiting[0]
+            relay_at = 0.0
+    return cur, relay_at, jumped
+
+
+def sess_build_msg(order, recs, states, cur, titles, labels):
+    """The {"t":"sess"} line. Fewer than two sessions = empty list, and the
+    board draws nothing (one session looks exactly like before)."""
+    if len(order) < 2:
+        return {"t": "sess", "a": "claude", "cur": "", "list": []}
+    show = list(order)
+    if len(show) > SESS_MAX:              # rare: keep the newest, and the current one
+        show = show[-SESS_MAX:]
+        if cur in order and cur not in show:
+            show = show[1:] + [cur]
+            show.sort(key=order.index)
+    items = [{"id": sid[:8], "ti": utf8_cut(titles.get(sid) or "", SESS_TITLE_MAX),
+              "dir": utf8_cut(labels.get(sid) or "", SESS_DIR_MAX),
+              "st": states.get(sid, "idle")} for sid in show]
+    return {"t": "sess", "a": "claude", "cur": (cur or "")[:8], "list": items}
+
+
+def sess_listed(now=None):
+    """Listed sessions in start order (call with `lock` held)."""
+    out = [(v.get("started", v.get("ts", 0)), sid) for sid, v in claude_sessions.items()
+           if v.get("pid") and v.get("tty")]
+    return [sid for _, sid in sorted(out)]
+
+
+def sess_find(id8):
+    """Full session_id for the board's 8-character id (call with `lock` held)."""
+    id8 = str(id8 or "")
+    if len(id8) < 4:
+        return None
+    for sid in claude_sessions:
+        if sid.startswith(id8):
+            return sid
+    return None
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, OverflowError):
+        return True
+
+
+def _ps(fields, pid):
+    try:
+        return subprocess.run(["ps", "-o", fields, "-p", str(pid)], capture_output=True,
+                              text=True, timeout=3).stdout
+    except Exception:
+        return ""
+
+
+def _etime_s(s):
+    """ps etime ([[dd-]hh:]mm:ss) -> seconds."""
+    s = s.strip()
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d) if d.isdigit() else 0
+    parts = [int(p) for p in s.split(":") if p.isdigit()]
+    sec = 0
+    for p in parts:
+        sec = sec * 60 + p
+    return days * 86400 + sec
+
+
+def _claude_pid_up(pid):
+    """The hook's $PPID may be a shell Claude Code put between itself and the
+    hook: walk up (at most 3 steps) to the process whose args read `claude`."""
+    for _ in range(4):
+        out = _ps("ppid=,args=", pid).strip()
+        if not out:
+            return None
+        ppid, _, args = out.partition(" ")
+        if _CLAUDE_ARGS_RE.search(args.strip()):
+            return int(pid)
+        if not ppid.strip().isdigit() or int(ppid) <= 1:
+            return None
+        pid = int(ppid)
+    return None
+
+
+def _claude_procs():
+    """Running claude processes: [(pid, tty)] (tty '' for none)."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,tty=,args="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return []
+    procs = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and _CLAUDE_ARGS_RE.search(parts[2]) \
+                and "agentpet_host" not in parts[2]:
+            tty = parts[1] if parts[1] not in ("??", "-") else ""
+            procs.append((int(parts[0]), "/dev/" + tty if tty else ""))
+    return procs
+
+
+def _proc_cwd(pid):
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+def _proc_env(pid):
+    """The few terminal variables from a process's start-up environment."""
+    try:
+        out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return {}
+    env = {}
+    for key in SESS_ENV_KEYS:
+        m = re.search(r"(?:^|\s)" + re.escape(key) + r"=(\S+)", out)
+        if m:
+            env[_SESS_ENV[key]] = m.group(1)
+    return env
+
+
+def sess_resolve(now):
+    """Find the claude process of every session that has none yet, then fill
+    what its environment knows (watcher thread: ps / lsof stay off the hook
+    path). Only sessions seen in the last hour are worth the ps."""
+    with lock:
+        todo = [(sid, dict(v)) for sid, v in claude_sessions.items()
+                if not v.get("pid") and now - v.get("ts", 0) < 3600
+                and now - v.get("res_at", 0) >= SESS_RESOLVE_EVERY_S]
+        for sid, _ in todo:
+            claude_sessions[sid]["res_at"] = now
+        # pid -> last-hook time of the session holding it: a newer session in
+        # the same folder may take a pid from an older one (an ended session
+        # that never sent SessionEnd); sess_tick then keeps only the newer
+        taken = {v["pid"]: v.get("ts", 0) for v in claude_sessions.values() if v.get("pid")}
+    if not todo:
+        return
+    todo.sort(key=lambda sv: -sv[1].get("ts", 0))    # newest first
+    procs = None
+    for sid, v in todo:
+        pid = _claude_pid_up(v["hpid"]) if v.get("hpid") else None
+        if not pid and v.get("cwd"):      # no header: the one claude in that folder
+            if procs is None:
+                procs = [(p, t, _proc_cwd(p)) for p, t in _claude_procs()]
+            hits = [p for p, t, c in procs if c == v["cwd"]
+                    and taken.get(p, -1) < v.get("ts", 0)]
+            pid = hits[0] if len(hits) == 1 else None
+        if not pid:
+            continue
+        fill = {"pid": pid}
+        tty = _ps("tty=", pid).strip()
+        if tty and tty not in ("??", "-"):
+            fill["tty"] = "/dev/" + tty
+        et = _ps("etime=", pid)
+        if et.strip():
+            fill["started"] = now - _etime_s(et)
+        env = _proc_env(pid)
+        with lock:
+            rec = claude_sessions.get(sid)
+            if rec is None:
+                continue
+            for k, val in env.items():
+                rec.setdefault(k, val)    # the hook's own headers win
+            rec.update(fill)
+            taken[pid] = rec.get("ts", 0)
+        log("claude session", sid[:8], "-> pid", pid, fill.get("tty", "no tty"),
+            sess_adapter(claude_sessions.get(sid, {}))[0] or "?")
+
+
+def sess_titles(now):
+    """Refresh each listed session's ai-title from its transcript tail; the
+    first look at a session reads the whole file once."""
+    with lock:
+        todo = [(sid, v.get("transcript"), bool(v.get("title")))
+                for sid, v in claude_sessions.items()
+                if v.get("pid") and v.get("transcript")
+                and now - v.get("title_at", 0) >= SESS_TITLE_EVERY_S]
+        for sid, _, _ in todo:
+            claude_sessions[sid]["title_at"] = now
+    for sid, path, have in todo:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 65536) if have else 0)
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        t = sess_title_from_tail(text)
+        if t:
+            with lock:
+                if sid in claude_sessions:
+                    claude_sessions[sid]["title"] = t
+
+
+def sess_tick(io=True):
+    """One pass: (optionally) find processes and titles, apply the policy,
+    push the board's line when it changed, raise the Mac tab after a request
+    jump. Hook path calls io=False (no ps / file reads under a hook)."""
+    global sess_cur, _sess_prev, _sess_prev_order, _sess_relay_at, _sess_typed
+    global _sess_last_line, _sess_relay_timer
+    now = time.time()
+    if io:
+        try:
+            sess_resolve(now)
+            sess_titles(now)
+            sess_save(now)
+        except Exception as e:
+            log("claude sessions:", e)
+    with lock:
+        # one listed session per claude process (/resume in place mints a new id)
+        by_pid = {}
+        for sid, v in list(claude_sessions.items()):
+            p = v.get("pid")
+            if p:
+                keep = by_pid.get(p)
+                if keep and claude_sessions[keep].get("ts", 0) >= v.get("ts", 0):
+                    del claude_sessions[sid]
+                    continue
+                if keep:
+                    del claude_sessions[keep]
+                by_pid[p] = sid
+        order = sess_listed()
+        states = {sid: sess_state(claude_sessions[sid], now) for sid in order}
+        needs_since = {sid: claude_sessions[sid].get("needs_since", 0) for sid in order}
+        activity = {sid: claude_sessions[sid].get("ts", 0) for sid in order}
+        prev_cur, typed = sess_cur, _sess_typed
+        cur, relay, jumped = sess_policy(order, _sess_prev_order, states, _sess_prev,
+                                         sess_cur, needs_since, activity, _sess_relay_at,
+                                         now, _sess_typed)
+        if relay and relay != _sess_relay_at:
+            arm = relay - now
+        else:
+            arm = None
+        sess_cur, _sess_relay_at, _sess_typed = cur, relay, None
+        _sess_prev, _sess_prev_order = states, order
+        titles = {sid: claude_sessions[sid].get("title") for sid in order}
+        labels = sess_dir_labels(order, claude_sessions)
+        msg = sess_build_msg(order, claude_sessions, states, cur, titles, labels)
+        fake = _sess_fake["msg"] if _sess_fake["until"] > now else None
+        agent_now = active_agent
+    if arm is not None:                   # land the hand-over on time, not on the next tick
+        if _sess_relay_timer:
+            _sess_relay_timer.cancel()
+        _sess_relay_timer = threading.Timer(arm + 0.05, sess_tick, kwargs={"io": False})
+        _sess_relay_timer.daemon = True
+        _sess_relay_timer.start()
+    line = json.dumps(fake or msg, ensure_ascii=False)
+    if line != _sess_last_line:
+        _sess_last_line = line
+        push_raw((line + "\n").encode())
+    if cur != prev_cur and cur:
+        log("claude session ->", cur[:8],
+            "(%s)" % ("request" if jumped else "typed" if typed == cur else "auto"))
+    if jumped and jumped != prev_cur and agent_now == "claude" and FOCUS_FOLLOW \
+            and not voice_down and not fake:
+        inject(lambda: focus_session(jumped))
+
+
+def sess_line():
+    """The current line, for the hello (a rebooted board knows no sessions)."""
+    return ((_sess_last_line or json.dumps({"t": "sess", "a": "claude", "cur": "", "list": []}))
+            + "\n").encode()
+
+
+def sess_pick(id8):
+    """Board tapped a half of the session row: show that session now, raise
+    its tab once the hand has been still for FOCUS_SETTLE_S."""
+    global sess_cur, _sess_focus_timer, _sess_last_line
+    with lock:
+        fake = _sess_fake["msg"] if _sess_fake["until"] > time.time() else None
+        if fake:                          # /test/sess: echo the pick, touch nothing real
+            fake["cur"] = str(id8 or "")[:8]
+            sid = None
+        else:
+            sid = sess_find(id8)
+            if sid:
+                sess_cur = sid
+    if fake:
+        _sess_last_line = None
+        sess_tick(io=False)
+        return
+    if not sid:
+        log("board session pick: unknown", id8)
+        return
+    log("board session pick:", sid[:8])
+    _sess_last_line = None                # echo it back even if nothing else changed
+    sess_tick(io=False)
+    if _sess_focus_timer:
+        _sess_focus_timer.cancel()
+
+    def go():
+        if FOCUS_FOLLOW and active_agent == "claude" and not voice_down:
+            inject(lambda: focus_session(sid))
+    _sess_focus_timer = threading.Timer(FOCUS_SETTLE_S, go)
+    _sess_focus_timer.daemon = True
+    _sess_focus_timer.start()
+
+
+def _osa(script, timeout=5):
+    """osascript -> (ok, stdout). Logs a refused Automation grant once per app."""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, ""
+    if r.returncode != 0:
+        log("focus session: osascript failed:", (r.stderr or "").strip()[:160])
+        return False, ""
+    return True, r.stdout.strip()
+
+
+def _as_str(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _focus_terminal(tty):
+    """Terminal.app: select the tab on that tty, read the front tab back and
+    try once more if it did not take (the first select after new windows
+    missed once in 12)."""
+    script = ('tell application id "com.apple.Terminal"\nset hit to false\n'
+              'repeat with w in windows\nrepeat with t in tabs of w\n'
+              f'if tty of t is {_as_str(tty)} then\nset selected of t to true\n'
+              'set index of w to 1\nset hit to true\nend if\nend repeat\nend repeat\n'
+              'if not hit then return ""\nactivate\ndelay 0.25\n'
+              'return tty of selected tab of front window\nend tell')
+    for _ in range(2):
+        ok, out = _osa(script)
+        if not ok or not out:
+            return False
+        if out == tty:
+            return True
+    return False
+
+
+def _focus_iterm(uuid):
+    script = ('tell application id "com.googlecode.iterm2"\n'
+              'repeat with w in windows\nrepeat with t in tabs of w\nrepeat with s in sessions of t\n'
+              f'if (id of s) is {_as_str(uuid)} then\nselect w\nselect t\nselect s\nactivate\n'
+              'return "ok"\nend if\nend repeat\nend repeat\nend repeat\nreturn ""\nend tell')
+    ok, out = _osa(script)
+    return ok and out == "ok"
+
+
+def _focus_ghostty(cwd, title):
+    script = ('tell application id "com.mitchellh.ghostty"\n'
+              f'set ts to every terminal whose working directory is {_as_str(cwd)}\n'
+              'if (count of ts) = 0 then return ""\nset pick to item 1 of ts\n'
+              + (f'repeat with x in ts\nif name of x contains {_as_str(title)} then set pick to x\n'
+                 'end repeat\n' if title else '')
+              + 'focus pick\nactivate\nreturn "ok"\nend tell')
+    ok, out = _osa(script)
+    return ok and out == "ok"
+
+
+def focus_session(sid):
+    """Bring session `sid`'s tab to the front. Returns the kind that worked:
+    warp / terminal / iterm / ghostty = that exact tab, app = only the app,
+    None = nothing to raise."""
+    global host_raise_at
+    with lock:
+        rec = dict(claude_sessions.get(sid) or {})
+    kind, arg = sess_adapter(rec)
+    host_raise_at = time.time()          # reverse follow stands down for our own raise
+    done = None
+    try:
+        if kind == "warp":
+            r = subprocess.run(["open", arg], capture_output=True, timeout=3)
+            done = "warp" if r.returncode == 0 else None
+        elif kind == "terminal":
+            done = "terminal" if _focus_terminal(arg) else None
+        elif kind == "iterm":
+            done = "iterm" if _focus_iterm(arg) else None
+        elif kind == "ghostty":
+            done = "ghostty" if _focus_ghostty(arg, rec.get("title") or "") else None
+        if not done and rec.get("bundle"):
+            subprocess.run(["open", "-b", rec["bundle"]], capture_output=True, timeout=3)
+            done = "app"
+        elif not done and FOCUS_APPS.get("claude"):
+            subprocess.run(["open", "-a", FOCUS_APPS["claude"]], capture_output=True, timeout=3)
+            done = "app"
+    except subprocess.TimeoutExpired:
+        log("focus session: timed out", kind)
+    _focus_raised["claude"] = time.time()
+    if done and done != "app":
+        _sess_front["sid"] = sid
+    log("focus session:", sid[:8], kind or "?", "->", done or "nothing")
+    return done
+
+
+def focus_session_fast(sid):
+    """focus_session before dictation / the send Enter: always re-assert the
+    tab, but pay the settle wait only when it was probably not in front (the
+    voice key must not gain latency when nothing moves)."""
+    with lock:
+        bundle = (claude_sessions.get(sid) or {}).get("bundle")
+    name = (_bundle_names.get(bundle) or "").lower()
+    known = _sess_front.get("sid") == sid and name and name in _frontmost_app().lower()
+    done = focus_session(sid)
+    time.sleep(0.1 if known else 0.35)
+    return done
+
+
+def sess_for_action(sid8=None):
+    """The session a board action on the Claude seat means: the one the board
+    named, else the one it shows, else the only one. None = no session info
+    (the old app-level path)."""
+    with lock:
+        if _sess_fake["until"] > time.time():
+            return None                   # /test/sess on screen: its ids are not real tabs
+        if sid8:
+            return sess_find(sid8)
+        if sess_cur in claude_sessions:
+            return sess_cur
+        order = sess_listed()
+        return order[0] if len(order) == 1 else None
+
+
+def approve_plan(sid8, sessions, now):
+    """Board approve/reject on the Claude seat -> (action, sid).
+    action: "go" (that tab, then the key), "drop" (already answered / gone:
+    type nothing), "refuse" (an app we can only raise holds two listed
+    sessions: we could hit the wrong tab, ask the user to answer on the Mac),
+    "legacy" (no session info: the old app-level path). Pure."""
+    if sid8:
+        sid = next((s for s in sessions if s.startswith(str(sid8))), None)
+        if not sid or sess_state(sessions[sid], now) != "needs_you":
+            return "drop", sid
+    else:
+        waiting = sorted((s for s, v in sessions.items() if sess_state(v, now) == "needs_you"),
+                         key=lambda s: sessions[s].get("needs_since", 0))
+        if not waiting:
+            return "legacy", None
+        sid = waiting[0]
+    kind, arg = sess_adapter(sessions[sid])
+    if kind is None:
+        return "legacy", None
+    if kind == "app":
+        same = [s for s, v in sessions.items()
+                if v.get("pid") and v.get("tty") and sess_adapter(v) == ("app", arg)]
+        if len(same) >= 2:
+            return "refuse", sid
+    return "go", sid
+
+
+SESS_FAKE_TITLES = ["Claude Code 多终端窗口管理", "Three body discussion", "公众号封面配色",
+                    "Fix BLE reconnect", "", "设置页总览补一行卡上字库", "Refactor push queue", "播客上卡转码"]
+SESS_FAKE_DIRS = ["esptouch", "05-VibeWriter", "公众号素材", "agenttouch", "esptouch·2",
+                  "esptouch·3", "agenttouch·2", "esptouch·4"]
+
+
+def test_sess(path):
+    """/test/sess endpoints (see the GET route)."""
+    global _sess_last_line
+    q = dict(parse_qsl(path.partition("?")[2]))
+    tail = path.partition("?")[0]
+    now = time.time()
+    if tail.endswith("/off"):
+        with lock:
+            _sess_fake.update(msg=None, until=0.0)
+        _sess_last_line = None
+        sess_tick(io=False)
+        return {"ok": True, "fake": False}
+    if tail.endswith("/list"):
+        with lock:
+            order = sess_listed()
+            rows = []
+            for sid, v in sorted(claude_sessions.items(), key=lambda kv: kv[1].get("started", 0)):
+                rows.append({"id": sid[:8], "listed": sid in order, "cur": sid == sess_cur,
+                             "st": sess_state(v, now), "pid": v.get("pid"), "hpid": v.get("hpid"),
+                             "tty": v.get("tty"), "term": v.get("term"), "bundle": v.get("bundle"),
+                             "adapter": sess_adapter(v)[0], "cwd": v.get("cwd"),
+                             "title": v.get("title"), "age_s": round(now - v.get("ts", now))})
+            return {"cur": (sess_cur or "")[:8], "sessions": rows, "line": _sess_last_line,
+                    "fake": _sess_fake["until"] > now}
+    if "/focus/" in tail:
+        with lock:
+            sid = sess_find(tail.rsplit("/", 1)[1])
+        if not sid:
+            return {"ok": False, "error": "no such session"}
+        return {"ok": True, "id": sid[:8], "done": focus_session(sid)}
+    n = max(0, min(SESS_MAX, int(q.get("n", 2) or 2)))
+    sts = [x.strip() for x in q.get("st", "").split(",") if x.strip()]
+    items = [{"id": "f%07d" % i, "ti": SESS_FAKE_TITLES[i], "dir": SESS_FAKE_DIRS[i],
+              "st": sts[i] if i < len(sts) else "working"} for i in range(n)]
+    cur = max(0, min(n - 1, int(q.get("cur", 0) or 0))) if n else 0
+    if q.get("dir") == "1":               # the folder-name fallback
+        for it in items:
+            it["ti"] = ""
+    if q.get("t0") and items:             # e.g. a long title for the 300 px cut
+        items[0]["ti"] = utf8_cut(q["t0"], SESS_TITLE_MAX)
+    msg = {"t": "sess", "a": "claude", "cur": items[cur]["id"] if n >= 2 else "",
+           "list": items if n >= 2 else []}
+    secs = float(q.get("s", 30) or 30)
+    with lock:
+        _sess_fake.update(msg=msg, until=now + secs)
+    _sess_last_line = None
+    sess_tick(io=False)
+    return {"ok": True, "fake": True, "for_s": secs, "msg": msg}
+
+
+def sess_term_apps():
+    """App names of the terminals hosting listed sessions (reverse follow:
+    the Claude seat owns whichever terminal its sessions run in). Only
+    terminals we can aim at a tab count: VS Code / Cursor / the Claude app
+    host other work too, and clicking into them must not pull the board to
+    the Claude seat."""
+    with lock:
+        bundles = {claude_sessions[s].get("bundle") for s in sess_listed()
+                   if sess_adapter(claude_sessions[s])[0] not in ("app", None)}
+    names = set()
+    for b in bundles:
+        if not b:
+            continue
+        if b not in _bundle_names:
+            name = ""
+            try:
+                from AppKit import NSWorkspace
+                with objc_pool():
+                    url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(b)
+                    if url:
+                        name = Path(str(url.path())).name.removesuffix(".app")
+            except Exception:
+                pass
+            _bundle_names[b] = name
+        if _bundle_names[b]:
+            names.add(_bundle_names[b])
+    return names
+
 def aggregate():
     now = time.time()
     with lock:
@@ -1519,6 +2315,12 @@ def aggregate():
             v = claude_sessions[sid]
             if now - v["ts"] > 6 * 3600:
                 del claude_sessions[sid]
+                continue
+            # its claude process is gone: a tab closed without SessionEnd
+            # would otherwise sit in the list for 6 h
+            if v.get("pid") and not _pid_alive(v["pid"]):
+                del claude_sessions[sid]
+                log("claude session gone (process exited):", sid[:8])
                 continue
             # interrupted mid-turn? (no Stop hook comes; see claude_interrupted_after)
             if v["state"] == "working" and now - v.get("tr_at", 0) >= 2:
@@ -1738,6 +2540,10 @@ def watcher_loop():
         except Exception as e:
             log("app log poll error:", e)
         aggregate()
+        try:
+            sess_tick()                  # Claude sessions -> board row
+        except Exception as e:
+            log("claude sessions error:", e)
         stretch_tick()
         try:
             front_follow_tick()          # Mac frontmost app -> board seat
@@ -2150,12 +2956,15 @@ def handle_board_msg(raw, reply):
         reply((json.dumps(almanac_msg()) + "\n").encode())
         reply((json.dumps(report_msg()) + "\n").encode())
         reply((json.dumps(cfg_msg()) + "\n").encode())
+        reply(sess_line())               # the session row: a rebooted board knows none
         np_now = np_hello_msg()          # a board that just booted knows nothing about the play page
         if np_now:
             reply((json.dumps(np_now) + "\n").encode())
             with np_lock:
                 np_rt["msg"] = np_now
                 np_rt["sent_at"] = time.time()
+    elif t == "sess_sel":                # board tapped a half of the session row
+        sess_pick(m.get("id"))
     elif t == "media":                   # play page, Mac source: pet -> the Mac's player
         threading.Thread(target=media_cmd, args=(m.get("cmd", ""),), daemon=True).start()
     elif t == "np_miss":                 # the board wants a cover that is not on the card
@@ -2218,6 +3027,7 @@ def handle_board_msg(raw, reply):
             to_front = m.get("to") == "front"
             global _voice_to_front
             _voice_to_front = to_front      # ... and so does the enter that follows
+            voice_sid = sess_for_action(m.get("sid")) if agent == "claude" and not to_front else None
             _mic_reset()
             with _mic_lock:
                 _mic["session_board"] = board_mic
@@ -2227,6 +3037,8 @@ def handle_board_msg(raw, reply):
                 # frontmost app is only true then (2026-09-05 stale-snapshot)
                 if to_front:
                     log("voice: -> front (%s)" % (_frontmost_app() or "?"))
+                elif voice_sid:
+                    focus_session_fast(voice_sid)   # that session's own tab
                 else:
                     raise_agent_app(agent)
 
@@ -2295,11 +3107,15 @@ def handle_board_msg(raw, reply):
                                 post_key("enter")))
             else:
                 target = active_agent
-                inject(lambda: (raise_agent_app(target), post_key("enter")))
+                sid = sess_for_action(m.get("sid")) if target == "claude" else None
+                if sid:                  # the session the words went to
+                    inject(lambda: (focus_session_fast(sid), post_key("enter")))
+                else:
+                    inject(lambda: (raise_agent_app(target), post_key("enter")))
         elif k == "undo":
             post_key("cmd+z")
         elif k in ("approve", "reject"):
-            decision_key(k)
+            decision_key(k, m.get("sid"))
         log("board key:", k)
     elif t == "qian":                    # almanac tapped: read today's fortune
         global _last_qian
@@ -7257,6 +8073,16 @@ class HookHandler(BaseHTTPRequestHandler):
             # status toast (name card + four seat dots) for 3 s — lets /test/shot capture it
             push_board({"t": "nudge"})
             self._ok()
+        elif self.path.startswith("/test/sess"):
+            # Claude sessions. /test/sess?n=4&st=working,idle,needs_you,needs_you
+            # &cur=2&s=30 holds a FAKE row on the board for screenshots (real
+            # sessions untouched; board taps only move the fake cursor);
+            # /test/sess/off ends it; /test/sess/list = the host's real table;
+            # /test/sess/focus/<id8> raises that session's tab (adapter test).
+            self._ok(json.dumps(test_sess(self.path), ensure_ascii=False).encode())
+        elif self.path == "/test/toast/mac_approve":
+            push_board({"t": "toast", "k": "mac_approve"})
+            self._ok()
         elif self.path.startswith("/test/pin/"):
             # 钉住 debug (doc/06): /test/pin/1 locks the pet page to the hand
             # (gravity only turns it upright), /test/pin/0 releases it. Single
@@ -7393,42 +8219,59 @@ class HookHandler(BaseHTTPRequestHandler):
         push_state()
 
     def claude_event(self, event, p):
-        sid = p.get("session_id", "?")
-        now = time.time()
-        with lock:
-            s = claude_sessions.setdefault(sid, {"state": "idle", "ts": now,
-                                                 "done_until": 0})
-            s["ts"] = now
-            if p.get("transcript_path"):
-                s["transcript"] = p["transcript_path"]
-            if event in ("PreToolUse", "PostToolUse", "UserPromptSubmit"):
-                s["state"] = "working"
-            elif event == "Notification":
-                # Two kinds arrive here: permission requests (real needs_you)
-                # and the 60s idle reminder ("Claude is waiting for your
-                # input"). The reminder must NOT raise the question-mark face
-                # — done/idle already said we finished; don't steal focus.
-                msg = (p.get("message") or "").lower()
-                if "waiting for" in msg and "input" in msg:
-                    # …but "waiting for input" does prove we are not working:
-                    # after an interrupt it is the 60 s safety net behind the
-                    # transcript check above
-                    if s["state"] == "working":
-                        s["state"] = "idle"
-                        log("claude idle reminder: working -> idle", sid[:8])
-                    else:
-                        log("claude idle reminder ignored:", sid[:8])
+        claude_hook(event, p, sess_meta_from_headers(self.headers))
+
+
+def claude_hook(event, p, meta=None):
+    global _sess_typed
+    sid = p.get("session_id", "?")
+    now = time.time()
+    with lock:
+        s = claude_sessions.setdefault(sid, {"state": "idle", "ts": now,
+                                             "done_until": 0, "started": now})
+        s["ts"] = now
+        if p.get("transcript_path"):
+            s["transcript"] = p["transcript_path"]
+        if p.get("cwd"):
+            s["cwd"] = p["cwd"]
+        for k, v in (meta or {}).items():     # terminal identity
+            if k == "hpid" and s.get("pid"):
+                continue
+            s[k] = v
+        if event == "UserPromptSubmit":
+            _sess_typed = sid                 # the board follows the tab you type in
+            _sess_front["sid"] = sid          # ... and that tab is the one in front
+        if event in ("PreToolUse", "PostToolUse", "UserPromptSubmit"):
+            s["state"] = "working"
+        elif event == "Notification":
+            # Two kinds arrive here: permission requests (real needs_you)
+            # and the 60s idle reminder ("Claude is waiting for your
+            # input"). The reminder must NOT raise the question-mark face
+            # — done/idle already said we finished; don't steal focus.
+            msg = (p.get("message") or "").lower()
+            if "waiting for" in msg and "input" in msg:
+                # …but "waiting for input" does prove we are not working:
+                # after an interrupt it is the 60 s safety net behind the
+                # transcript check above
+                if s["state"] == "working":
+                    s["state"] = "idle"
+                    log("claude idle reminder: working -> idle", sid[:8])
                 else:
-                    s["state"] = "needs_you"
-            elif event == "Stop":
-                s["state"] = "idle"
-                s["done_until"] = now + DONE_LINGER
-            elif event == "SessionStart":
-                s["state"] = "idle"
-            elif event == "SessionEnd":
-                claude_sessions.pop(sid, None)
-        aggregate()
-        push_state()
+                    log("claude idle reminder ignored:", sid[:8])
+            else:
+                if s["state"] != "needs_you":
+                    s["needs_since"] = now    # first come, first answered
+                s["state"] = "needs_you"
+        elif event == "Stop":
+            s["state"] = "idle"
+            s["done_until"] = now + DONE_LINGER
+        elif event == "SessionStart":
+            s["state"] = "idle"
+        elif event == "SessionEnd":
+            claude_sessions.pop(sid, None)
+    aggregate()
+    push_state()
+    sess_tick(io=False)
 
 # ------------------------------------------------------------------ main
 def main():
@@ -7436,6 +8279,7 @@ def main():
     mem_debug_start()                 # before any thread: the base snapshot is a quiet host
     load_overrides()
     load_report()
+    sess_load()                       # Claude sessions survive a host restart
     np_apply()                        # media-control listener
     threading.Thread(target=watcher_loop, daemon=True).start()
     threading.Thread(target=ble_thread, daemon=True).start()

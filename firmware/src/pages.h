@@ -40,6 +40,7 @@ int playZoneAt(int px, int py);
 // Both are drawn in the page's own rotation, last. k = 1 while the pill
 // holds, fading to 0 over the last 400 ms; k = 0 draws nothing.
 void drawPagePin(Arduino_Canvas* c, bool lit, uint16_t seatColor);
+void drawPageBatt(Arduino_Canvas* c, int pct, uint32_t t);   // bottom-left, <20 % only
 void drawPillToast(Arduino_Canvas* c, const char* label, float k, int cy = 368);
 
 // 赛博黄历 (this orientation's home page; data pushed daily by host)

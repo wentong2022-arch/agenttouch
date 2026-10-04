@@ -168,6 +168,23 @@ static void showToast(const char* s, uint32_t ms = 1500) {
   toastUntil = millis() + ms;
   toastOnBubble = false;
 }
+// Low-battery 名牌 (2026-10-04, user: the face-only corner icon was never
+// seen): on battery, the first <20 % reading shows it, the first <10 % one
+// again, and while it stays low it comes back every 10 min (<20 %) / 5 min
+// (<10 %) — user asked for the repeat the same day. 0 = none shown yet,
+// 1 = the <20 % one, 2 = the <10 % one; re-armed by the charger or by the
+// reading climbing 3 points back over a threshold.
+static uint8_t  lowBattWarned = 0;
+static uint32_t lowBattToastAt = 0;
+// debug: /test/raw?j={"t":"batt","pct":15,"s":60} fakes the gauge for the
+// corner icons and the 名牌 ONLY — never the <=5 % shutdown or the sigh;
+// "rep":20 shortens the repeat to 20 s while the fake lasts
+static int      battFakePct = -1;
+static uint32_t battFakeUntil = 0, battFakeRepMs = 0;
+static bool battFakeOn() {
+  if (battFakePct >= 0 && (int32_t)(battFakeUntil - millis()) <= 0) battFakePct = -1;
+  return battFakePct >= 0;
+}
 // voice_style (host cfg "voice": chirp|tts, NVS "vtts"): with TTS on and the
 // TCP link up the HOST speaks fresh needs_you/done (and falls back to pushing
 // the chirp if synthesis fails) — so the board keeps quiet for those two.
@@ -1717,6 +1734,14 @@ static void handleLine(const String& line) {
       showToast(tr(S_APPROVE_ON_MAC), 2000);
       toastOnBubble = true;
     }
+  } else if (strcmp(t, "batt") == 0) {      // debug via /test/raw: fake gauge {"pct":15,"s":60}; pct<0 ends it
+    int p = d["pct"] | -1;
+    uint32_t s = d["s"] | 30;
+    battFakePct = p > 100 ? 100 : p;
+    battFakeUntil = millis() + (s > 600 ? 600 : s) * 1000;
+    battFakeRepMs = (uint32_t)(d["rep"] | 0) * 1000;
+    lowBattWarned = 0;                     // so the faked level shows its 名牌
+    Serial.printf("batt fake: %d for %us\n", battFakePct, (unsigned)s);
   } else if (strcmp(t, "nudge") == 0) {     // host debug (/test/nudge): status toast + seat dots for 3 s, for /test/shot
     nudgeUntil = millis() + 3000;
   } else if (strcmp(t, "pin") == 0) {       // host debug (/test/pin/0|1): 钉住
@@ -3360,6 +3385,36 @@ void loop() {
         lastLowSigh = now;                 // a soft nag every ~3 min
         audioPlay(SND_SIGH);
       }
+
+      // low-battery 名牌 on whatever page is up (the pill every page draws).
+      // Held back while the face is asking for an approve — the pill would
+      // sit on the bubble — or the pet sleeps face-down (panel off), and
+      // shown on the first poll after that. Not noteActivity(): the panel
+      // goes full only while the pill is up (idle dimming below), so the
+      // repeats neither keep a low battery's screen lit nor hush the sighs.
+      bool fake = battFakeOn();
+      int p = fake ? battFakePct : pct;
+      if (p < 0 || (vbus && !fake)) {
+        lowBattWarned = 0;
+      } else {
+        uint8_t rearm = p < 13 ? 2 : p < 23 ? 1 : 0;   // 3-point hysteresis
+        if (lowBattWarned > rearm) lowBattWarned = rearm;
+        uint8_t lvl = p < 10 ? 2 : p < 20 ? 1 : 0;
+        uint32_t every = (fake && battFakeRepMs) ? battFakeRepMs
+                       : (lvl == 2 ? 5 : 10) * 60000UL;
+        bool again = lvl && lowBattWarned >= lvl &&
+                     (int32_t)(now - lowBattToastAt) > (int32_t)every;
+        if ((lvl > lowBattWarned || again) && !flipped &&
+            sessEffState() != ST_NEEDS_YOU) {
+          if (lvl > lowBattWarned) lowBattWarned = lvl;
+          lowBattToastAt = now;
+          char msg[40];
+          snprintf(msg, sizeof(msg), tr(S_LOW_BATT), p);
+          showToast(msg, 4000);
+          Serial.printf("low batt: %d%%%s%s\n", p, again ? " again" : "",
+                        fake ? " (fake)" : "");
+        }
+      }
     }
   }
 
@@ -3415,9 +3470,14 @@ void loop() {
     } else nextBored = 0;
   }
 
-  // idle dimming: stay bright while anything deserves attention
+  // idle dimming: stay bright while anything deserves attention — a 名牌
+  // included, so the low-battery one is read at full brightness. Bounded by
+  // the longest 名牌 (4 s): a never-set toastUntil of 0 must not read as
+  // "up" once millis() passes 2^31 (day 24.8).
   {
-    bool attention = listening || pickedUp || demoStart;
+    int32_t toastLeft = (int32_t)(toastUntil - now);
+    bool attention = listening || pickedUp || demoStart ||
+                     (toastLeft > 0 && toastLeft <= 4000);
     for (int i = 0; i < N_AGENTS && !attention; i++)
       attention = agentStates[i] == ST_WORKING || agentStates[i] == ST_NEEDS_YOU;
     uint8_t want = BRIGHT_LVLS[brightLvl];
@@ -3551,6 +3611,10 @@ void loop() {
       }
       // the same corner pin the face wears: seat color for 10 s, then grey
       if (pinned) drawPagePin(canvas, (int32_t)(pinLitUntil - now) > 0, AGENTS[selected].color);
+      // low battery: the face's corner icon, bottom-left here (pages.cpp)
+      drawPageBatt(canvas, battFakeOn() ? battFakePct
+                           : (pmuOk && pmu.isBatteryConnect()) ? pmu.getBatteryPercent()
+                           : -1, now);
       int toastCy = pg == PAGE_CALENDAR ? (wantAlm && almanacValid() ? 286 : 368)
                   : (cv == CV_CLOCK ? (langEn() ? 296 : 300) : 368);   // en panel top is 320
       drawPillToast(canvas, pinLabel, pinK, toastCy);
@@ -3596,7 +3660,8 @@ void loop() {
     f.wifiUp = WiFi.status() == WL_CONNECTED;
     f.hostUp = hostUp || bleConnected();
     f.battPct = -1;
-    if (pmuOk && pmu.isBatteryConnect()) f.battPct = pmu.getBatteryPercent();
+    if (battFakeOn()) f.battPct = battFakePct;
+    else if (pmuOk && pmu.isBatteryConnect()) f.battPct = pmu.getBatteryPercent();
     f.volume = audioVolume();
     // 眼神追声: eyes drift toward the last confident sound for
     // ~1.5 s, then ease back. Board axis (+ = MIC1, the right edge keys-up)

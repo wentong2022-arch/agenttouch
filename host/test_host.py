@@ -2921,7 +2921,10 @@ class MemLoopClockTests(unittest.TestCase):
                                       kwargs={"period_s": 60, "stop": stop, "tick_s": 0.01},
                                       daemon=True)
                 th.start()
-                time.sleep(0.2)
+                # poll, not a fixed 0.2 s: a busy CI runner managed 4 ticks in it
+                deadline = time.time() + 2
+                while len(H.mem_hist) < 5 and time.time() < deadline:
+                    time.sleep(0.02)
             self.assertNotIn("mem:", out.getvalue())
             self.assertGreaterEqual(len(H.mem_hist), 5)
             t, kb, th_n = H.mem_hist[0]
@@ -2929,7 +2932,7 @@ class MemLoopClockTests(unittest.TestCase):
             self.assertGreaterEqual(th_n, 1)
             body = H.mem_hist_body()
             self.assertEqual(body["now_mb"], round(H.mem_hist[-1][1] / 1024, 1))
-            self.assertIsNone(body["slope_mb_h"])            # a 0.2 s span is not a trend
+            self.assertIsNone(body["slope_mb_h"])            # a seconds-long span is not a trend
             # the start-up climb is drawn but never sloped: +12 MB in the first
             # two minutes, then a flat 33 min, must read as a flat line
             H.mem_hist.clear()

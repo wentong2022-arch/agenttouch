@@ -993,6 +993,23 @@ void drawPagePin(Arduino_Canvas* c, bool lit, uint16_t seatColor) {
   c->fillRoundRect(cx - 2, cy + 2, 4, 12, 2, col);
 }
 
+// Low-battery icon for the side pages (2026-10-04): the face's top-right icon,
+// same size and colors, in the bottom-left corner instead — level with the pin
+// (cy 440) on the other side, and clear of the almanac's date and the play
+// card's rounded corner, which sit where the face has it. <20 % only, blinks
+// below 10 %; pct -1 (no battery / unknown) draws nothing.
+static const uint16_t BATT_RIM = C565(0x4A, 0x52, 0x5C);
+static const uint16_t BATT_RED = C565(0xFF, 0x5A, 0x4A);
+void drawPageBatt(Arduino_Canvas* c, int pct, uint32_t t) {
+  if (pct < 0 || pct >= 20) return;
+  if (pct < 10 && (t / 500) % 2) return;
+  const int x = 19, y = 434;
+  c->drawRoundRect(x, y, 26, 13, 3, BATT_RIM);
+  c->fillRect(x + 26, y + 4, 3, 6, BATT_RIM);
+  int fw = 20 * pct / 20;
+  c->fillRoundRect(x + 3, y + 3, max(2, fw), 7, 2, BATT_RED);
+}
+
 // Plain pill, centred on cy: each page hands in its own empty band (face and
 // play pages 368 = above the volume bar / nameplate; clock 300 = between the
 // digits and the 时辰 box; almanac 286 = between 忌 and the 信号 row), so the

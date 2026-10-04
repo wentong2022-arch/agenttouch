@@ -118,6 +118,7 @@ Six skins: classic, kitty, robo, bunny, sprout and grok. Each seat wears one, an
 ## Battery and power
 
 - The settings card shows the battery level, with `CHG` while charging and `FULL` when done.
+- On battery, when the level first drops below 20 %, a "Battery low" pill shows the percentage for 4 seconds on whatever page is up, and again below 10 %. While it stays low the pill comes back every 10 minutes (every 5 below 10 %), and a small battery icon stays on screen: top-right on the pet page, bottom-left on the other pages.
 - Below 10 % it sighs every 3 minutes; at 5 % it powers itself off.
 - Away from known Wi-Fi for 3 minutes, it turns Wi-Fi off to save power. Bluetooth keeps working; only spoken announcements need Wi-Fi.
 

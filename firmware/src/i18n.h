@@ -23,6 +23,7 @@ enum StrId : uint8_t {
   S_APP_NETEASE, S_APP_MUSIC, S_APP_PODCASTS, S_APP_CHROME, S_APP_SAFARI,
   S_CLAIM_Q, S_CLAIM_OK, S_CLAIM_DONE, S_CLAIM_NEW, S_CLAIM_FROM,   // claim card
   S_APPROVE_ON_MAC,                          // host toast {"k":"mac_approve"}
+  S_LOW_BATT,                                // low-battery 名牌, format string (%d = percent)
   N_STRS
 };
 
@@ -38,6 +39,7 @@ static const char* const STR[N_LANGS][N_STRS] = {
     "网易云音乐", "Apple Music", "播客", "Chrome", "Safari",
     "连到这台 Mac？", "连接", "已连接", "还没有主人", "现在跟着「%s」",
     "请在 Mac 上批准",
+    "电量低 · %d%%",
   },
   {   // en
     "Approve", "hold to reject", "Send",
@@ -50,6 +52,7 @@ static const char* const STR[N_LANGS][N_STRS] = {
     "NetEase Music", "Apple Music", "Podcasts", "Chrome", "Safari",
     "Connect to this Mac?", "Connect", "Connected", "No owner yet", "Currently following \"%s\"",
     "Approve on the Mac",
+    "Battery low · %d%%",
   },
 };
 

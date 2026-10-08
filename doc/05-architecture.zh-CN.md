@@ -182,7 +182,7 @@ host/
 
 | Hook | 效果 |
 |---|---|
-| `UserPromptSubmit`、`PreToolUse`、`PostToolUse` | `working`；120 s 没有新 hook 回到 `idle` |
+| `UserPromptSubmit`、`PreToolUse`、`PostToolUse` | `working`；15 分钟没有新 hook 回到 `idle`（只是兜底：`Stop`、检测到打断或空闲提醒会先结束这一轮），该会话还有 Bash 工具命令在跑时不回 |
 | `Notification` | `needs_you`；但「waiting for your input」这条闲置提醒永远不算 |
 | `Stop` | `done` |
 | `SessionStart` / `SessionEnd` | 会话以 `idle` 加入 / 移除 |

@@ -182,7 +182,7 @@ Hooks in `~/.claude/settings.json` POST each event to `http://127.0.0.1:8788/hoo
 
 | Hook | Effect |
 |---|---|
-| `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `working`; back to `idle` after 120 s without hooks |
+| `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `working`; back to `idle` after 15 min without hooks (a safety net: `Stop`, a detected interrupt or the idle reminder end a turn first), and not while a Bash-tool command of that session is still running |
 | `Notification` | `needs_you`, except the "waiting for your input" idle reminder, which never raises it |
 | `Stop` | `done` |
 | `SessionStart` / `SessionEnd` | session added as `idle` / removed |

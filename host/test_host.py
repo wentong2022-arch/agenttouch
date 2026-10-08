@@ -4527,6 +4527,29 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertNotIn("gone", H.claude_sessions)
         self.assertIn("here", H.claude_sessions)
 
+    def test_long_tool_shell_keeps_working(self):
+        """One long Bash call sends no hooks; its live shell holds 'working'."""
+        now = time.time()
+        old = now - H.CLAUDE_WORK_DECAY - 5
+        H.claude_sessions["busy"] = {"state": "working", "ts": old, "done_until": 0, "pid": 4711}
+        H.claude_sessions["quiet"] = {"state": "working", "ts": old, "done_until": 0, "pid": 4712}
+        H.claude_sessions["ended"] = {"state": "idle", "ts": old, "done_until": 0, "pid": 4713}
+        with mock.patch.object(H, "_tool_shell_parents", lambda: {4711, 4713}):
+            H.sess_keep_busy(now)
+        self.assertEqual(H.sess_state(H.claude_sessions["busy"], now), "working")
+        self.assertEqual(H.sess_state(H.claude_sessions["quiet"], now), "idle")
+        self.assertNotIn("busy_at", H.claude_sessions["ended"])   # after Stop: background shells don't count
+        # the ps check is throttled to CLAUDE_BUSY_EVERY_S
+        with mock.patch.object(H, "_tool_shell_parents", lambda: self.fail("ps again")):
+            H.sess_keep_busy(now + 1)
+
+    def test_tool_shell_parents_parses_ps(self):
+        out = ("  31139 /bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'sleep 9'\n"
+               "  31139 /Users/x/.local/bin/uv tool uvx mcp-server-fetch\n"
+               "    1 /usr/sbin/cfprefsd agent\n")
+        with mock.patch.object(H.subprocess, "run", lambda *a, **k: mock.Mock(stdout=out)):
+            self.assertEqual(H._tool_shell_parents(), {31139})
+
     def test_reverse_follow_takes_any_session_terminal(self):
         self.assertEqual(H.front_agent("iTerm2|iTerm", {"claude": ("Warp", "iTerm")}), "claude")
         self.assertEqual(H.front_agent("Warp|Warp", {"claude": ("Warp", "iTerm")}), "claude")

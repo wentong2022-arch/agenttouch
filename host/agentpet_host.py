@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-04a"
+HOST_VERSION = "2026-10-05b"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -364,7 +364,17 @@ ACTIVITY_WINDOW = 60          # seconds
 # "done" during long thinking gaps or lag the real finish — don't go back.
 QWEN_DB = (Path.home() / "Library" / "Application Support" /
            "QwenWorkCN" / "data" / "agents.db")
-CLAUDE_WORK_DECAY = 120       # working -> idle after this much hook silence
+# working -> idle after this much hook silence. Only a safety net: Stop,
+# the transcript interrupt check and the 60 s "waiting for your input"
+# reminder end a turn first. Long thinking, an advisor call or a background
+# subagent writing its report send no hooks for minutes (2026-10-05: gaps of
+# 2 and 9 min showed idle under the old 120 s).
+CLAUDE_WORK_DECAY = 900
+# ...and past it while a Bash-tool shell still runs under that claude: one
+# long command sends no hook until it ends. Claude Code runs each one as `zsh -c source …/shell-snapshots/…`.
+CLAUDE_TOOL_SHELL = "/.claude/shell-snapshots/"
+CLAUDE_BUSY_AFTER = CLAUDE_WORK_DECAY - 120   # look for such a shell near the deadline
+CLAUDE_BUSY_EVERY_S = 15      # and how often after that
 DONE_LINGER = 90              # "done" face duration after Stop
 
 # Voice input: "hold_fn" holds the fn (globe) key down while the board's
@@ -1690,11 +1700,16 @@ def sess_adapter(rec):
     return None, None
 
 
+def sess_work_ts(v):
+    """Last sign of work: a hook, or a tool shell seen alive (sess_keep_busy)."""
+    return max(v.get("ts", 0), v.get("busy_at", 0))
+
+
 def sess_state(v, now):
     """One session's own state, by the same rules the seat merge uses."""
     if v.get("state") == "needs_you":
         return "needs_you"
-    if v.get("state") == "working" and now - v.get("ts", 0) < CLAUDE_WORK_DECAY:
+    if v.get("state") == "working" and now - sess_work_ts(v) < CLAUDE_WORK_DECAY:
         return "working"
     if v.get("done_until", 0) > now:
         return "done"
@@ -1872,6 +1887,43 @@ def _claude_procs():
     return procs
 
 
+def _tool_shell_parents():
+    """Pids that have a Claude Code Bash-tool shell as a direct child."""
+    try:
+        out = subprocess.run(["ps", "-axo", "ppid=,args="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return set()
+    parents = set()
+    for line in out.splitlines():
+        ppid, _, args = line.strip().partition(" ")
+        if ppid.isdigit() and CLAUDE_TOOL_SHELL in args:
+            parents.add(int(ppid))
+    return parents
+
+
+def sess_keep_busy(now):
+    """A working session gone quiet for CLAUDE_BUSY_AFTER: if its claude still
+    has a tool shell running, mark it busy so the decay waits (watcher thread:
+    ps stays off the hook path). Only while no Stop has come, so a background
+    shell left after the turn cannot hold the face."""
+    with lock:
+        todo = [sid for sid, v in claude_sessions.items()
+                if v.get("state") == "working" and v.get("pid")
+                and now - sess_work_ts(v) >= CLAUDE_BUSY_AFTER
+                and now - v.get("busy_chk", 0) >= CLAUDE_BUSY_EVERY_S]
+        for sid in todo:
+            claude_sessions[sid]["busy_chk"] = now
+    if not todo:
+        return
+    parents = _tool_shell_parents()
+    with lock:
+        for sid in todo:
+            v = claude_sessions.get(sid)
+            if v and v.get("state") == "working" and v.get("pid") in parents:
+                v["busy_at"] = now
+
+
 def _proc_cwd(pid):
     try:
         out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
@@ -1983,6 +2035,7 @@ def sess_tick(io=True):
     if io:
         try:
             sess_resolve(now)
+            sess_keep_busy(now)
             sess_titles(now)
             sess_save(now)
         except Exception as e:
@@ -2333,7 +2386,7 @@ def aggregate():
             vals = claude_sessions.values()
             if any(v["state"] == "needs_you" for v in vals):
                 s = "needs_you"
-            elif any(v["state"] == "working" and now - v["ts"] < CLAUDE_WORK_DECAY
+            elif any(v["state"] == "working" and now - sess_work_ts(v) < CLAUDE_WORK_DECAY
                      for v in vals):
                 s = "working"
             elif any(v.get("done_until", 0) > now for v in vals):

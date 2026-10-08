@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-05b"
+HOST_VERSION = "2026-10-08a"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -484,8 +484,18 @@ qwen_run = {"streaming": False, "done_until": 0.0,
 # the end, final char is 。), delivery turns end "随时告诉我。" (no ？at all),
 # and chit-chat questions ("有什么我能帮你的吗？") come from seconds-long
 # turns — hence tail-window search + a minimum turn duration, not endswith.
+# 2026-10-08: "？/? anywhere in the window" also fired on a
+# finished task whose reply ended in a boilerplate footer (a rhetorical
+# question, a line of instructions, then a link): the only mark inside the
+# window was the URL's query '?'. Links are stripped first, and the LAST ？
+# must sit within QWEN_ASK_GAP chars of the end (a real ask ends near its
+# question; a footer question has ~30 chars after it).
 QWEN_ASK_MIN_TURN = 30    # seconds of real work before the question test
 QWEN_ASK_TAIL = 60        # chars from the end searched for ？/?
+QWEN_ASK_GAP = 25         # max chars after the last ？; footer questions carry ~30
+# markdown links, then bare URLs — ASCII only, so a URL glued to the next
+# words by a full-width comma does not swallow the question after it
+_QWEN_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)|(?:https?://|www\.)[\x21-\x7e]+")
 QWEN_NEEDS_TTL = 600      # like codex approvals: stale after 10 min
 # QwenWork approval log (2026-09-02, user hit the gap live): the app's own
 # session main.log prints "[Permission] registerPendingApproval {...}" when a
@@ -1198,10 +1208,16 @@ def qwen_asked_question():
                 "ORDER BY sequence DESC LIMIT 1").fetchone()
         finally:
             con.close()
-        tail = (row[0] or "").strip()[-QWEN_ASK_TAIL:] if row else ""
-        return "？" in tail or "?" in tail
+        return qwen_text_asks(row[0] if row else "")
     except Exception:
         return False
+
+
+def qwen_text_asks(text):
+    """Pure (test_host.py): does a final reply end by asking the user?"""
+    tail = _QWEN_LINK.sub(" ", (text or "").strip())[-QWEN_ASK_TAIL:]
+    i = max(tail.rfind("？"), tail.rfind("?"))
+    return i != -1 and len(tail) - i <= QWEN_ASK_GAP
 
 def codex_turn_is_main(p):
     """The Codex desktop app runs side threads through the same notify hook —

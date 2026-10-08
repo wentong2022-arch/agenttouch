@@ -4384,6 +4384,32 @@ class OwnerTests(unittest.TestCase):
         self.assertIn('"owner": owner_snapshot()', src)
 
 
+class QwenAskTests(unittest.TestCase):
+    """2026-10-08: which final QwenWork replies count as asking the user."""
+
+    # full-width marks as QwenWork writes them; the words are placeholders
+    def test_url_query_and_footer_are_not_questions(self):
+        # the only mark near the end is the link's query '?'
+        self.assertFalse(H.qwen_text_asks(
+            "**Need help？** Read the FAQ first, or write down what happened and "
+            "send it to us. See [help](https://example.com/help?topic=a)。"))
+        # a rhetorical question with a line of instructions after it
+        self.assertFalse(H.qwen_text_asks("Questions？ Write them down and send them to us, we reply soon。"))
+        self.assertFalse(H.qwen_text_asks("Details: [docs](https://x.com/a?b=1)。"))
+        self.assertFalse(H.qwen_text_asks("Details: https://x.com/a?b=1 。"))
+
+    def test_real_asks_still_count(self):
+        self.assertTrue(H.qwen_text_asks("All sorted. Shall I go on？"))
+        self.assertTrue(H.qwen_text_asks("Which one？Say more, I'll help。"))   # the clarify shape
+        # a bare URL glued to the next words must not swallow the question after it
+        self.assertTrue(H.qwen_text_asks("Preview at https://x.com/a，deploy it？"))
+
+    def test_delivery_endings(self):
+        self.assertFalse(H.qwen_text_asks("The file is on your desktop. Tell me if anything is off。"))
+        self.assertFalse(H.qwen_text_asks(""))
+        self.assertFalse(H.qwen_text_asks(None))
+
+
 class ClaudeSessionTests(unittest.TestCase):
     """several Claude Code terminals — the board's session row and the
     session-exact routing behind it. Nothing here raises a window or types."""

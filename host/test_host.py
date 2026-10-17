@@ -362,6 +362,85 @@ class CodexNotifyTests(unittest.TestCase):
         ok, _ = H.codex_turn_is_main({"type": "agent-turn-complete"})
         self.assertTrue(ok)
 
+    # first lines as the app wrote them 2026-10-17 (trimmed): a sub-agent's
+    # and the auto-reviewer's turn-complete fired false dones mid-task
+    def _rollout(self, tid, meta):
+        d = H.CODEX_SESSIONS / "2026" / "10" / "17"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"rollout-2026-10-17T17-45-27-{tid}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": meta}) + "\n{}\n")
+
+    def test_subagent_thread_is_ignored(self):
+        tid = "01a1492e-e35a-70c0-9de5-73347ed2b059"
+        self._rollout(tid, {"id": tid, "parent_thread_id": "01a1492d", "thread_source": "subagent",
+                            "source": {"subagent": {"thread_spawn": {"depth": 1}}}})
+        ok, why = H.codex_turn_is_main({"type": "agent-turn-complete", "thread-id": tid})
+        self.assertFalse(ok)
+        self.assertIn("subagent", why)
+
+    def test_guardian_thread_is_ignored(self):
+        tid = "01a14940-8387-72c2-b227-7b4d06063944"
+        self._rollout(tid, {"id": tid, "thread_source": "guardian_review",
+                            "source": {"subagent": {"other": "guardian"}}})
+        ok, why = H.codex_turn_is_main({"type": "agent-turn-complete", "thread-id": tid})
+        self.assertFalse(ok)
+        self.assertIn("guardian_review", why)
+
+    def test_user_thread_counts(self):
+        tid = "01a1492d-e8ff-7bc1-9a92-cb328a86c92a"
+        self._rollout(tid, {"id": tid, "source": "vscode", "thread_source": "user"})
+        ok, _ = H.codex_turn_is_main({"type": "agent-turn-complete", "thread-id": tid})
+        self.assertTrue(ok)
+
+    def test_thread_side_pure(self):
+        self.assertIsNone(H.codex_thread_side({}))
+        self.assertIsNone(H.codex_thread_side({"source": "vscode"}))
+        self.assertEqual(H.codex_thread_side({"source": {"subagent": {}}}), "subagent")
+
+
+class CodexHookNeedsTests(unittest.TestCase):
+    """PermissionRequest hook: 5 s grace, then the asking thread's own rollout
+    decides (2026-10-17: auto-review answered four requests in 1-2 s)."""
+    T = 1000.0
+
+    def needs(self, dt, file_mtime, global_mt=0.0):
+        return H.codex_hook_needs(self.T + dt, self.T, self.T + 600, file_mtime, global_mt)
+
+    def test_inside_grace_never(self):
+        self.assertFalse(self.needs(4.9, self.T))
+
+    def test_quiet_asker_after_grace(self):
+        # the reviewer / other sub-agents writing does not hide a real card
+        self.assertTrue(self.needs(5, self.T + 0.5, global_mt=self.T + 4))
+
+    def test_answered_by_reviewer(self):
+        # 17:47:34 request -> asking thread wrote again at +3 s
+        self.assertFalse(self.needs(6, self.T + 3))
+
+    def test_no_transcript_falls_back_to_any_write(self):
+        self.assertTrue(self.needs(6, None, global_mt=self.T + 2))
+        self.assertFalse(self.needs(6, None, global_mt=self.T + 4))
+
+    def test_expired(self):
+        self.assertFalse(H.codex_hook_needs(self.T + 601, self.T, self.T + 600, self.T, 0))
+
+
+class CodexBusyTests(unittest.TestCase):
+    END = 1000.0
+
+    def test_cpu_after_turn_end_without_writes_is_not_work(self):
+        # 17:53:54 main turn done, CPU hot at +2 s, no rollout write since
+        self.assertFalse(H.codex_busy(False, True, self.END + 2, self.END, self.END + 1))
+
+    def test_cpu_stretches_a_started_turn(self):
+        self.assertTrue(H.codex_busy(False, True, self.END + 60, self.END, self.END + 15))
+
+    def test_cpu_before_any_turn_end(self):
+        self.assertTrue(H.codex_busy(False, True, 50.0, 0.0, 40.0))
+
+    def test_recent_writes_win(self):
+        self.assertTrue(H.codex_busy(True, False, 0.0, self.END, self.END + 20))
+
 
 # ------------------------------------------------------------------ reverse focus follow
 class FrontAgentTests(unittest.TestCase):

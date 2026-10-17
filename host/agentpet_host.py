@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-17a"
+HOST_VERSION = "2026-10-17b"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -1506,13 +1506,47 @@ def codex_turn_is_main(p):
     if not tid:
         return True, "no thread id"          # older notify format: keep the old behaviour
     try:
-        if any(CODEX_SESSIONS.rglob(f"*{tid}.jsonl")):
-            return True, "rollout found"
+        found = next(iter(CODEX_SESSIONS.rglob(f"*{tid}.jsonl")), None)
     except OSError:
         return True, "sessions unreadable"
+    if found:
+        # 2026-10-17: the app's own sub-agents (multi_agent v2) and its
+        # auto-reviewer ("guardian") DO get rollouts, and each finished
+        # sub-task fired a false done mid-task. Their first line says so.
+        side = codex_thread_side(codex_rollout_meta(found))
+        if side:
+            return False, "side thread (%s)" % side
+        return True, "rollout found"
     first = (p.get("input-messages") or [""])[0] or ""
     kind = "task title" if "short title" in first else "no rollout"
     return False, "side thread (%s): %r" % (kind, first[:40].replace("\n", " "))
+
+_codex_meta_cache = {}        # path -> session_meta payload (written once, never changes)
+
+def codex_rollout_meta(path):
+    """The session_meta payload on a rollout's first line, {} if unreadable."""
+    if path in _codex_meta_cache:
+        return _codex_meta_cache[path]
+    try:
+        with open(path, "rb") as f:
+            d = json.loads(f.readline().decode("utf-8", "replace"))
+        meta = d.get("payload") if isinstance(d, dict) and isinstance(d.get("payload"), dict) else {}
+    except (OSError, ValueError):
+        return {}                 # not cached: the line may still be half written
+    _codex_meta_cache[path] = meta
+    return meta
+
+def codex_thread_side(meta):
+    """Pure (test_host.py): None for a thread the user started, else what
+    kind of side thread it is. Rollouts from before thread_source existed
+    count as the user's."""
+    ts = meta.get("thread_source")
+    if ts and ts != "user":
+        return ts                 # "subagent", "guardian_review"
+    src = meta.get("source")
+    if isinstance(src, dict) and "subagent" in src:
+        return "subagent"
+    return None
 
 # Codex's second kind of approval card (2026-09-27, ChatGPT.app 26.924, code
 # mode): the model asks for access with tools.request_permissions(...) inside
@@ -1528,6 +1562,32 @@ CODEX_TAIL_BYTES = 256 * 1024 # tool outputs make long lines; the verdict needs 
 _CODEX_SKIP = ("token_usage_record",)          # line types that follow a call without answering it
 _CODEX_SKIP_EVENTS = ("token_count",)
 _codex_tail_cache = {}        # path -> ((size, mtime), call_id or None)
+# PermissionRequest hook grace (2026-10-17, user picked 5 s): with the app's
+# auto-review on, a reviewer thread answers most requests in 1-2 s and the
+# asking thread runs on at +3 s; raising needs_you at once made the board jump
+# to Codex and pull ChatGPT to the front four times in two minutes for cards
+# the user never saw. A real card shows 5 s late.
+CODEX_NEEDS_GRACE = 5
+
+def codex_hook_needs(now, since, until, file_mtime, global_mt):
+    """Pure (test_host.py): is a hook-path approval request still waiting on
+    the user? `file_mtime` = the asking thread's rollout (None if the payload
+    named none, then any session write counts, as before 10-17). The asking
+    thread's own file, not every file: the reviewer and other sub-agents keep
+    writing while it waits."""
+    if not (until > now and now - since >= CODEX_NEEDS_GRACE):
+        return False
+    if file_mtime is None:
+        return global_mt <= since + 3
+    return file_mtime <= since + 1
+
+def codex_busy(recent, cpu_busy, cpu_hot_last, turn_end, mt):
+    """Pure (test_host.py): Codex working? Rollout writes since the last turn
+    end are the real signal; the CPU heuristic only stretches a turn that has
+    started (a long silent reasoning stretch). After a turn ends the app keeps
+    burning CPU on the title turn and its UI — 10-17 that flipped a finished
+    task back to working twice with no rollout write at all."""
+    return recent or (cpu_busy and cpu_hot_last > turn_end and mt > turn_end + 10)
 
 def codex_rollout_pending(lines):
     """call_id of the request_permissions call a rollout ends on, or None.
@@ -2710,11 +2770,18 @@ def aggregate():
             # after the notify fires — measured 2026-08-27)
             recent = mt > now - ACTIVITY_WINDOW and mt > codex_notify["turn_end"] + 10
             # CPU linger must not outlive a turn-complete notify and mask "done"
-            busy = recent or (cpu_busy["codex"]
-                              and _cpu_hot_last["codex"] > codex_notify["turn_end"])
-            # approval request pending, and no session writes since it fired
-            needs = (codex_notify["needs_until"] > now
-                     and mt <= codex_notify["needs_since"] + 3)
+            busy = codex_busy(recent, cpu_busy["codex"], _cpu_hot_last["codex"],
+                              codex_notify["turn_end"], mt)
+            # approval request pending past the grace, and the asking thread quiet
+            nf = codex_notify.get("needs_file")
+            fm = None
+            if nf:
+                try:
+                    fm = os.path.getmtime(nf)
+                except OSError:
+                    fm = 0.0
+            needs = codex_hook_needs(now, codex_notify["needs_since"],
+                                     codex_notify["needs_until"], fm, mt)
             # a request_permissions card (no hook fires for it, see
             # codex_rollout_pending); one the board already answered stays
             # answered while the rest of its exec script runs
@@ -8596,11 +8663,12 @@ class HookHandler(BaseHTTPRequestHandler):
         typ = (p.get("type") or p.get("hook_event_name") or "")
         typ = typ.replace("_", "-").lower()
         now = time.time()
-        log("codex notify:", typ or p)
+        tid = p.get("thread-id") or p.get("thread_id") or p.get("agent_id") or p.get("session_id") or ""
+        log("codex notify:", typ or p, tid[:8])
         with lock:
             if "turn-complete" in typ:
                 main, why = codex_turn_is_main(p)
-                if not main:                 # the app's title/summary side turn, not the task
+                if not main:                 # title turn / sub-agent / reviewer, not the task
                     log("codex notify: ignored,", why)
                     return
                 codex_notify["turn_end"] = now
@@ -8609,6 +8677,9 @@ class HookHandler(BaseHTTPRequestHandler):
                   "input" in typ or "elicit" in typ):
                 codex_notify["needs_since"] = now
                 codex_notify["needs_until"] = now + 600
+                # the asking thread's own rollout (a sub-agent's, often):
+                # it moving again = the request was answered
+                codex_notify["needs_file"] = p.get("transcript_path") or ""
         aggregate()
         push_state()
 

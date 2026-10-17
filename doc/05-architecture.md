@@ -196,9 +196,9 @@ To bring a session's tab forward the host uses `open <WARP_FOCUS_URL>` in Warp, 
 
 ### Codex
 
-- **working**: a `codex` process is running (the ChatGPT app embeds one) and `~/.codex/sessions` was written in the last 60 s, or the process is busy on CPU.
-- **done**: Codex's `notify` command in `~/.codex/config.toml` runs `~/.agentpet/codex_notify.sh`, which forwards `agent-turn-complete`. Side threads the desktop app starts, such as titling a task, have no session file and are ignored.
-- **needs_you** has two sources. The `PermissionRequest` hook in `~/.codex/hooks.json` covers escalated shell commands. Code-mode permission cards fire no hook, so the host also reads recent session files: an unanswered `request_permissions` call, quiet for 2 s, counts. Either clears when the session moves on, at turn end, or after 10 minutes.
+- **working**: a `codex` process is running (the ChatGPT app embeds one) and `~/.codex/sessions` was written in the last 60 s, or the process is busy on CPU. After a turn ends, CPU alone does not count until the session files are written again (the app keeps burning CPU on titling and its UI).
+- **done**: Codex's `notify` command in `~/.codex/config.toml` runs `~/.agentpet/codex_notify.sh`, which forwards `agent-turn-complete`. Side threads are ignored: titling a task (no session file), and the app's sub-agents and auto-review threads (their session file's first line says `thread_source` `subagent` / `guardian_review`). Only a thread the user started counts.
+- **needs_you** has two sources. The `PermissionRequest` hook in `~/.codex/hooks.json` covers escalated shell commands; it shows after 5 s, and only if the asking thread's own session file has stayed quiet (auto-review usually answers in 1–2 s, and the board must not jump to Codex for a card nobody sees). Code-mode permission cards fire no hook, so the host also reads recent session files: an unanswered `request_permissions` call, quiet for 2 s, counts. Either clears when the session moves on, at turn end, or after 10 minutes.
 
 `~/.codex/hooks.json` (`host/setup.sh` writes it, keeping any hooks already there):
 

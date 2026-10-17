@@ -196,9 +196,9 @@ host/
 
 ### Codex
 
-- **working**：有 `codex` 进程（ChatGPT app 内嵌一个），并且 `~/.codex/sessions` 最近 60 s 有写入，或进程 CPU 在忙。
-- **done**：`~/.codex/config.toml` 里的 `notify` 命令运行 `~/.agentpet/codex_notify.sh`，把 `agent-turn-complete` 转给 host。桌面 app 另开的侧线程（比如给任务起标题）没有会话文件，直接忽略。
-- **needs_you** 有两个来源。`~/.codex/hooks.json` 里的 `PermissionRequest` hook 管提权的 shell 命令。代码模式的权限卡不触发任何 hook，所以 host 还会读最近的会话文件：一条没人回答、静默满 2 s 的 `request_permissions` 调用也算。两种都在会话继续写入、这一轮结束或 10 分钟后清掉。
+- **working**：有 `codex` 进程（ChatGPT app 内嵌一个），并且 `~/.codex/sessions` 最近 60 s 有写入，或进程 CPU 在忙。一轮结束后，光 CPU 忙不算，要等会话文件再有写入（app 做完后还在起标题、刷界面，CPU 会忙一阵）。
+- **done**：`~/.codex/config.toml` 里的 `notify` 命令运行 `~/.agentpet/codex_notify.sh`，把 `agent-turn-complete` 转给 host。侧线程一律忽略：给任务起标题的（没有会话文件），以及 app 自己的子 agent 和自动审核线程（会话文件第一行 `thread_source` 是 `subagent` / `guardian_review`）。只有用户自己开的线程算数。
+- **needs_you** 有两个来源。`~/.codex/hooks.json` 里的 `PermissionRequest` hook 管提权的 shell 命令；等 5 s 再亮，且发请求的那个线程自己的会话文件这期间没动过才亮（自动审核通常 1–2 s 就批了，没人看得到的卡不该让板子跳到 Codex）。代码模式的权限卡不触发任何 hook，所以 host 还会读最近的会话文件：一条没人回答、静默满 2 s 的 `request_permissions` 调用也算。两种都在会话继续写入、这一轮结束或 10 分钟后清掉。
 
 `~/.codex/hooks.json`（`host/setup.sh` 会写好，保留已有的其他 hook）：
 

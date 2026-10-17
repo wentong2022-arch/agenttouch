@@ -497,7 +497,7 @@ static const char* stateLabel(const FaceFrame& f) {
 // pinning the (selected-agent) nameplate text alongside them.
 static void drawToast(Arduino_Canvas* c, const FaceFrame& f, uint32_t t,
                       float kText, float kDots) {
-  if (kText > 0.03f) {
+  if (kText > 0.03f) {         // (the done caption fades this line out: faceRender)
     uint16_t accent = AGENTS[f.agentIdx].color;
     const char* name = AGENTS[f.agentIdx].name;
     const char* st = stateLabel(f);
@@ -545,7 +545,9 @@ static void drawToast(Arduino_Canvas* c, const FaceFrame& f, uint32_t t,
     switch (f.agentStates[i]) {
       case ST_WORKING:   lvl = 0.75f + 0.25f * sinf(t * 6.2832f / 1800.0f); break;
       case ST_NEEDS_YOU: lvl = (t / 300) % 2 ? 1.0f : 0.3f; break;
-      case ST_DONE:      lvl = 0.9f;  break;
+      // done = idle brightness since 2026-10-17: what is new is the white
+      // core below (unread), and it stays until the Mac has seen it
+      case ST_DONE:      lvl = 0.62f; break;
       // idle/off lifted 2026-09-05 (user: "only the orange one looks lit"):
       // 45 % of a saturated blue or purple on the black AMOLED reads as off.
       // Working still breathes above, needs still blinks, so state survives.
@@ -556,7 +558,16 @@ static void drawToast(Arduino_Canvas* c, const FaceFrame& f, uint32_t t,
     // 184..296, four on 198..282, a lone seat sits dead center on 240)
     int dx = 240 - (nvis - 1) * 14 + slot * 28;
     slot++;
-    c->fillCircle(dx, 454, 5, dim565(AGENTS[i].color, lvl * k));
+    if (f.unread[i] && f.agentStates[i] != ST_NEEDS_YOU) {
+      // 未读完成: the dot turns white, the
+      // seat color steps out to a thin r 7 ring — the selected seat keeps
+      // only its usual r 9 ring (two rings 2 px apart read as one thick
+      // one, device shot 10-17); needs_you's blink wins
+      c->fillCircle(dx, 454, 5, dim565(EYE, k));
+      if (i != f.agentIdx) c->drawCircle(dx, 454, 7, dim565(AGENTS[i].color, k));
+    } else {
+      c->fillCircle(dx, 454, 5, dim565(AGENTS[i].color, lvl * k));
+    }
     if (i == f.agentIdx)
       c->drawCircle(dx, 454, 9, dim565(AGENTS[i].color, 0.65f * k));
   }
@@ -891,6 +902,62 @@ static void drawSessRow(Arduino_Canvas* c, const FaceFrame& f, uint32_t t, float
   srChevron(c, +1, f.sessLit > 0 ? litC : dimC);
 }
 
+// ---- 未读完成 (canvas FwFzmu7JqSNhtKvKnWAdmA) ----
+// Done caption: the bottom line's own place, font and tracking, saying
+// 「● Codex · Done」 (or a Claude session's label) — rolls up 14 px in over
+// 260 ms, holds 3 s, rolls out the same way; the selected seat's line fades
+// out under it and back after. No page or seat change, the face is untouched.
+static const int CAP_ROLL_MS = 260, CAP_HOLD_MS = 3000, CAP_SHIFT = 14;
+static const int CAP_TOTAL_MS = CAP_ROLL_MS * 2 + CAP_HOLD_MS;
+
+// 0..1 visibility of the caption at `age` ms, and its y offset (px, + = down)
+static float capVis(int age, int* dy) {
+  float in = ease(constrain(age / (float)CAP_ROLL_MS, 0.0f, 1.0f));
+  float out = ease(constrain((age - CAP_ROLL_MS - CAP_HOLD_MS) / (float)CAP_ROLL_MS, 0.0f, 1.0f));
+  if (dy) *dy = (int)lroundf(CAP_SHIFT * (1 - in) - CAP_SHIFT * out);
+  return in * (1 - out);
+}
+
+static void drawCaption(Arduino_Canvas* c, const FaceFrame& f) {
+  int dy;
+  float k = capVis(f.capAge, &dy);
+  if (k <= 0.03f || f.capSeat < 0 || f.capSeat >= N_AGENTS) return;
+  const char* name = f.capName ? f.capName : AGENTS[f.capSeat].name;
+  static const char* DONE = "Done";
+  c->setTextSize(1);
+  c->setFont(u8g2_font_fur17_tr);
+  int wn = f.capSmall ? almanacTextWidthSmallTrack(name, 1) : trackWidth(c, name, 3);
+  int wd = trackWidth(c, DONE, 3);
+  int y = 424 + dy;
+  int x = 240 - (8 + 10 + wn + 9 + 6 + 9 + wd) / 2;
+  c->fillCircle(x + 4, 418 + dy, 4, dim565(AGENTS[f.capSeat].color, k));
+  x += 18;
+  if (f.capSmall) {
+    c->setFont((const GFXfont*)nullptr);
+    almanacPrintSmallTrack(c, x, y, name, dim565(GREYTXT, k), 1);
+    c->setFont(u8g2_font_fur17_tr);
+  } else {
+    trackPrint(c, x, y, name, 3, dim565(GREYTXT, k));
+  }
+  x += wn + 9;
+  c->fillCircle(x + 3, 418 + dy, 3, dim565(GREYDIM, k));
+  x += 15;
+  trackPrint(c, x, y, DONE, 3, dim565(EYE, k));     // white: the news
+  c->setFont((const GFXfont*)nullptr);
+}
+
+// Session dots (canvas 会话 A, user 10-17: white / grey only, no ring): one
+// per session under the top row, white = finished and not yet looked at on
+// the Mac, grey = the rest. Only while at least one is unread, and they stay
+// when the row fades — on a black backing, so the bunny's ear can't eat them.
+static void drawSessDots(Arduino_Canvas* c, const FaceFrame& f) {
+  int n = f.sessN, gap = 16, y = 72;
+  int x0 = 240 - (n - 1) * gap / 2;
+  c->fillRoundRect(x0 - 14, y - 10, (n - 1) * gap + 28, 20, 10, BG);
+  for (int j = 0; j < n; j++)
+    c->fillCircle(x0 + j * gap, y, 4, (f.sessUnread >> j) & 1 ? EYE : GREYDIM);
+}
+
 void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   const AgentDef& A = AGENTS[f.agentIdx];
   uint16_t accent = A.color;
@@ -952,19 +1019,27 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   // agent is working/needs/done — a Qoder task must stay visible from the
   // claude seat, not flash for 3 s. The session row shares `k`.
   float toastK;
+  // done caption: not over the voice face, offline, or the selected seat's
+  // pinned approve line (needs_you holds the bottom; the chirp and the white
+  // dot still tell it)
+  bool capOn = f.capAge >= 0 && f.capAge < CAP_TOTAL_MS && !f.offline && !f.listening &&
+               f.agentStates[f.agentIdx] != ST_NEEDS_YOU;
+  float capK = capOn ? capVis(f.capAge, nullptr) : 0.0f;
   {
     bool bgActive = false;
     if (!f.offline && !f.listening)
       for (int i = 0; i < N_AGENTS; i++)
-        if (i != f.agentIdx && (f.agentStates[i] == ST_WORKING ||
-                                f.agentStates[i] == ST_NEEDS_YOU ||
-                                f.agentStates[i] == ST_DONE))
+        if ((i != f.agentIdx && (f.agentStates[i] == ST_WORKING ||
+                                 f.agentStates[i] == ST_NEEDS_YOU ||
+                                 f.agentStates[i] == ST_DONE)) ||
+            f.unread[i])          // a white dot waits for the Mac: it stays up
           bgActive = true;
     float k = hold ? 1.0f : toastAgeK((int32_t)(t - switchT));
     float kDots = (hold || bgActive) ? 1.0f : k;
-    if (k > 0.03f || kDots > 0.03f) drawToast(c, f, t, k, kDots);
+    if (k > 0.03f || kDots > 0.03f) drawToast(c, f, t, k * (1 - capK), kDots);
     toastK = k;
   }
+  if (capOn) drawCaption(c, f);
   // Claude 多会话 top row: drawn after the eyes (below), decided here
   // so the low-battery icon can step out of its way
   bool rowUp = f.sessN >= 2 && toastK > 0.03f;
@@ -1122,6 +1197,7 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   // Claude 多会话 top row: after the head props and eyes so its black
   // backing covers the bunny's ear tip; same k as the bottom line
   if (rowUp) drawSessRow(c, f, t, toastK);
+  if (f.sessN >= 2 && f.sessUnread) drawSessDots(c, f);   // after the row: on top of its backing
   s_srK = rowUp ? toastK : 0.0f;
   s_srAt = millis();
 

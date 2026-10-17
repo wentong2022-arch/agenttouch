@@ -36,6 +36,13 @@ When an agent asks for permission, its state becomes **needs you**. Whatever the
 - The host brings the agent's window to the front, then presses the key for you (Enter / Esc by default; change it per seat in the settings page).
 - Once answered, the board goes back to the page it was on.
 
+## Who just finished
+
+When an agent finishes a task, the board does not change pages or seats. It tells you who it was in two quiet ways, on the face page only:
+
+- **A 3-second line** at the bottom: `● Codex · Done`. For a Claude session it names the session, like `● Fix the parser · Done`.
+- **A white dot.** That seat's status light turns white, with a thin ring in the seat's color. It stays white until you look at that agent **on the Mac**: its app is in front and you touch the keyboard or mouse. If it finishes while its window is already in front and you used the Mac in the last minute, that counts too: the dot clears when the line ends. Swiping to the seat on the board does not count, and neither does time. Starting a new task there also counts as looking.
+
 ## Several Claude Code windows
 
 Open as many Claude Code terminals as you like; the Claude seat still shows one face. With two or more, a short row appears at the top of the face, together with the bottom status line (when you tap, and while the session shown is waiting for you): the session's title, the same one Claude puts on the terminal tab (or its folder when there is none), and its place, like `2/4`.
@@ -44,6 +51,7 @@ Open as many Claude Code terminals as you like; the Claude seat still shows one 
 - The face, the **Approve** bubble and dictation all follow the session on the top row: what you see is what you act on. The Mac brings that session's tab to the front 1.5 s after your last tap.
 - A permission request in another session moves the row there at once, and its tab comes to the front. When several are waiting they are answered one by one, in the order they asked; the counter turns green while others are queued.
 - Typing in a session on the Mac moves the row to it.
+- A row of small dots under the title shows which sessions finished and you have not seen yet: white = finished, grey = the rest. The dots stay after the row fades, until you look at that session on the Mac (its tab in front and a key or mouse touch) or type in it. Warp, Terminal, iTerm2 and Ghostty tell the host which tab is in front; in VS Code, Cursor and others, typing in the session is what clears it.
 - The exact tab is found in Warp and Terminal; iTerm2 and Ghostty are supported but not tested yet. Terminal, iTerm2 and Ghostty ask once whether `AgentPetHost` may control them. In other terminals (VS Code, Cursor, …) only the app can be brought forward, so when two sessions share one of them the board asks you to approve on the Mac instead of guessing the tab.
 - Sessions that were already running when you installed or updated AgentTouch are found by their folder; no need to restart them.
 

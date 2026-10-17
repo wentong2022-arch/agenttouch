@@ -97,6 +97,15 @@ static bool pmuOk = false, imuOk = false, tpOk = false;
 
 // ---------- app state ----------
 static uint8_t  agentStates[N_AGENTS] = {ST_OFF};   // ST_OFF == 0: the rest zero-init
+// 未读完成: seats the host says finished and were
+// not yet looked at on the Mac — {"t":"state",…,"u":["codex"]}. The host
+// decides everything (front app, tab title, real input); the board only
+// paints a white dot. An old host sends no "u": nothing is unread.
+static bool     agentUnread[N_AGENTS] = {false};
+// done caption: host {"t":"toast","k":"done","a":seat[,"id":session id8]}
+static int8_t   capSeat = -1;
+static char     capId[9] = "";
+static uint32_t capAt = 0;
 static int      selected  = 0;
 static bool     hostUp    = false;
 static bool     listening = false;
@@ -482,6 +491,7 @@ struct SessItem {
   char    ti[65];             // Claude's ai-title, ≤ 64 bytes (may be "")
   char    dir[33];            // folder name, host already made it unique
   uint8_t st;                 // AgentState of THIS session
+  bool    u;                  // finished, not yet looked at on the Mac ("u":1)
 };
 static SessItem sessList[SESS_MAX];
 static char     sessLabel[SESS_MAX][72];   // what the row prints, fitted to 300 px
@@ -579,6 +589,7 @@ static void sessHandle(JsonDocument& d) {
     sessCopy(it.ti, sizeof(it.ti), o["ti"] | "");
     sessCopy(it.dir, sizeof(it.dir), o["dir"] | "");
     it.st = stateByName(o["st"] | "off");
+    it.u = (o["u"] | 0) != 0;
   }
   sessN = (uint8_t)n;
   sessSeat = (int8_t)seat;
@@ -1586,6 +1597,11 @@ static void handleLine(const String& line) {
       agentStates[idx] = stateByName(kv.value() | "off");
     }
     if (memcmp(prev, agentStates, sizeof(prev)) != 0) noteActivity();
+    memset(agentUnread, 0, sizeof(agentUnread));
+    for (JsonVariantConst v : d["u"].as<JsonArrayConst>()) {
+      int idx = agentIdxById(v | "");
+      if (idx >= 0) agentUnread[idx] = true;
+    }
     // chirp on fresh needs_you / done from any agent (needs wins the push)
     bool fresh_needs = false, fresh_done = false;
     for (int i = 0; i < N_AGENTS; i++) {
@@ -1733,6 +1749,16 @@ static void handleLine(const String& line) {
     if (!strcmp(k, "mac_approve")) {
       showToast(tr(S_APPROVE_ON_MAC), 2000);
       toastOnBubble = true;
+    } else if (!strcmp(k, "done")) {        // done caption
+      int idx = agentIdxById(d["a"] | "");
+      if (idx >= 0) {                        // a later one simply replaces it (user 10-17)
+        capSeat = (int8_t)idx;
+        strlcpy(capId, d["id"] | "", sizeof(capId));
+        capAt = millis();
+        // never roll it on a dimmed face — but a desk page shows no caption,
+        // so a finish must not light up the clock / almanac (user rule 10-17)
+        if (shownPage == PAGE_FACE) noteActivity();
+      }
     }
   } else if (strcmp(t, "batt") == 0) {      // debug via /test/raw: fake gauge {"pct":15,"s":60}; pct<0 ends it
     int p = d["pct"] | -1;
@@ -3639,6 +3665,7 @@ void loop() {
     f.bored     = (int32_t)(boredUntil - now) > 0;
     f.stretch   = (int32_t)(stretchUntil - now) > 0;
     for (int i = 0; i < N_AGENTS; i++) f.agentStates[i] = agentStates[i];
+    for (int i = 0; i < N_AGENTS; i++) f.unread[i] = agentUnread[i];
     // Claude 多会话: with ≥2 sessions on the seat on screen
     // the face, the bottom state word, this seat's dot, the approve bubble and
     // the pinned toast all follow the CURRENT session. Only this frame's copy
@@ -3654,6 +3681,18 @@ void loop() {
       f.sessQueue = sessQueued();
       f.sessDir   = sessDir;
       f.sessLit   = (int32_t)(sessLitUntil - now) > 0 ? sessLit : 0;
+      for (int i = 0; i < sessN; i++)
+        if (sessList[i].u) f.sessUnread |= (uint8_t)(1u << i);
+    }
+    // done caption: 3.52 s from its arrival; a Claude session's id names it
+    // by the row's own fitted label when that session is in the table
+    f.capAge = -1;
+    if (capSeat >= 0 && (int32_t)(now - capAt) < 3600) {
+      f.capAge  = (int16_t)(now - capAt);
+      f.capSeat = capSeat;
+      f.capName = AGENTS[capSeat].name;
+      int si = (sessN >= 2 && sessSeat == capSeat) ? sessFind(capId) : -1;
+      if (si >= 0) { f.capName = sessLabel[si]; f.capSmall = true; }
     }
     f.sessGen = sessGen;
     f.showOff = showOffSeats;

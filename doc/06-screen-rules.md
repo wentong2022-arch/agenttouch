@@ -9,7 +9,7 @@ This page answers one question: at any moment, which page should the screen show
 **needs_you is the only agent state allowed to take over the screen.** The rest of the time the screen belongs to you: it shows the page for how the board is placed or held. If you want the pet, you call it (shake the board); the board never guesses.
 
 - needs_you takes over because there is something to do: an approve bubble.
-- working and done never move pages. They are ambient: the face page shows them when it is up, and done also plays a sound.
+- working and done never move pages. They are ambient: the face page shows them when it is up, and done also plays a sound. A finished seat also gets a 3-second `● Name · Done` line and a white status light on the face page, which stays until you look at that agent on the Mac (see Usage → Who just finished). Neither one changes the page or the seat.
 - When two intents conflict, the most recent deliberate one wins (see Last intent wins).
 
 ### What a takeover does

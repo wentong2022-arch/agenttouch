@@ -20,6 +20,7 @@ struct FaceFrame {
   bool       stretch;         // host says the human worked too long
   int8_t     lookX, lookY;    // 眼神追声: eye offset toward the last sound, page-frame px
   uint8_t    agentStates[N_AGENTS];  // all agents, for the mini status dots
+  bool       unread[N_AGENTS];       // finished, not yet looked at on the Mac -> white dot
   bool       showOff;         // 「显示离线席位」: draw off seats too
   int        battPct;         // 0..100, -1 = unknown
   bool       wifiUp;
@@ -62,6 +63,13 @@ struct FaceFrame {
   int8_t     sessDir;         // roll of the latest change: +1 up, -1 down
   int8_t     sessLit;         // chevron being pressed: -1 ‹, +1 ›, 0 none
   uint16_t   sessGen;         // bumps when the current session or the count moves
+  uint8_t    sessUnread;      // bit i: session i finished, not yet looked at (dots under the row)
+  // done caption: the bottom line says
+  // 「● <name> · Done」 for 3 s when any seat / Claude session finishes
+  int16_t    capAge;          // ms since it started, -1 = none
+  int8_t     capSeat;         // AGENTS index (its dot color)
+  const char* capName;        // seat name, or the session's fitted label
+  bool       capSmall;        // capName is a session label: tiny18 (CJK), not fur17
 };
 
 // Skins: same soul, different body. Affects eye shape + head props everywhere

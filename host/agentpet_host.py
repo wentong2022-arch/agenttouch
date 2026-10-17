@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-08a"
+HOST_VERSION = "2026-10-17a"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -376,6 +376,33 @@ CLAUDE_TOOL_SHELL = "/.claude/shell-snapshots/"
 CLAUDE_BUSY_AFTER = CLAUDE_WORK_DECAY - 120   # look for such a shell near the deadline
 CLAUDE_BUSY_EVERY_S = 15      # and how often after that
 DONE_LINGER = 90              # "done" face duration after Stop
+
+# 未读完成 (2026-10-17): a seat — or one Claude
+# session — that finished stays "unread" (white dot on the board) until the
+# user looks at it ON THE MAC: its app (its tab, with ≥2 Claude sessions) is
+# frontmost AND real keyboard / mouse input came after both the finish and
+# that window reaching the front. A board swipe raises the app on the Mac
+# (focus follow) but types nothing, so it never counts; neither does time.
+# Starting new work there (a seat back to working, a prompt typed into the
+# session) counts. The keys the host posts itself (fn for dictation, the
+# approve keys) reset the HID idle clock exactly like a hand would (probed
+# 2026-10-17), so input within UNREAD_KEY_GUARD_S of our own post is ignored.
+UNREAD_KEY_GUARD_S = 0.5
+# ...and one case needs no input at all (user 10-17: "the Warp tab was in
+# front the whole time, I saw it finish"): it finished in the window that was
+# ALREADY frontmost (its tab, with ≥2 Claude sessions) and the user had
+# touched the Mac within UNREAD_PRESENT_S before — they are sitting there
+# looking at it. Cleared once the caption has run (UNREAD_FRONT_GRACE_S).
+# Away longer, or the window came forward only afterwards (alt-tab, a board
+# swipe's raise): the input rule above as before.
+UNREAD_PRESENT_S = 60
+UNREAD_FRONT_GRACE_S = 3.5
+unread_seats = {}            # agent -> finished at (never "claude": its sessions carry it)
+unread_sess = {}             # Claude session_id -> finished at (listed sessions only)
+_unread_caps = []            # done captions waiting for the watcher ({"t":"toast","k":"done",…})
+_unread_front = {"key": None, "since": 0.0}   # what is frontmost, and since when
+_unread_pushed = None        # last "u" list the board got
+_host_key_at = 0.0           # last key event the host posted itself
 
 # Voice input: "hold_fn" holds the fn (globe) key down while the board's
 # voice button is held — matches WeChat IME's hold-fn-to-talk (and any IME
@@ -857,6 +884,94 @@ def _frontmost_app():
         log("frontmost query failed:", e)
         return ""
 
+_ax_lib = None
+
+def _ax_focused_title(pid):
+    """Accessibility fallback for _front_window_title(): the focused window's
+    AXTitle of `pid`, '' when not trusted or the app does not answer. ctypes,
+    because /usr/bin/python3's PyObjC ships no ApplicationServices bridge.
+    A 0.3 s messaging timeout: a hung app must not stall the watcher."""
+    global _ax_lib
+    import ctypes
+    if _ax_lib is None:
+        _ax_lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        for fn, res, args in (
+                ("AXIsProcessTrusted", ctypes.c_bool, []),
+                ("AXUIElementCreateApplication", ctypes.c_void_p, [ctypes.c_int]),
+                ("AXUIElementSetMessagingTimeout", ctypes.c_int, [ctypes.c_void_p, ctypes.c_float]),
+                ("AXUIElementCopyAttributeValue", ctypes.c_int,
+                 [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]),
+                ("CFStringCreateWithCString", ctypes.c_void_p,
+                 [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]),
+                ("CFStringGetCString", ctypes.c_bool,
+                 [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]),
+                ("CFGetTypeID", ctypes.c_ulong, [ctypes.c_void_p]),
+                ("CFStringGetTypeID", ctypes.c_ulong, []),
+                ("CFRelease", None, [ctypes.c_void_p])):
+            f = getattr(_ax_lib, fn)
+            f.restype, f.argtypes = res, args
+    L, UTF8 = _ax_lib, 0x08000100
+    if not L.AXIsProcessTrusted():
+        return ""
+    held = []
+    try:
+        app = L.AXUIElementCreateApplication(pid)
+        if not app:
+            return ""
+        held.append(app)
+        L.AXUIElementSetMessagingTimeout(app, 0.3)
+        out = ctypes.c_void_p()
+        k_win = L.CFStringCreateWithCString(None, b"AXFocusedWindow", UTF8)
+        k_title = L.CFStringCreateWithCString(None, b"AXTitle", UTF8)
+        held += [k_win, k_title]
+        if L.AXUIElementCopyAttributeValue(app, k_win, ctypes.byref(out)) or not out.value:
+            return ""
+        win = out.value
+        held.append(win)
+        out = ctypes.c_void_p()
+        if L.AXUIElementCopyAttributeValue(win, k_title, ctypes.byref(out)) or not out.value:
+            return ""
+        held.append(out.value)
+        if L.CFGetTypeID(out.value) != L.CFStringGetTypeID():
+            return ""
+        buf = ctypes.create_string_buffer(1024)
+        if not L.CFStringGetCString(out.value, buf, len(buf), UTF8):
+            return ""
+        return buf.value.decode("utf-8", "replace")
+    finally:
+        for r in held:
+            L.CFRelease(r)
+
+
+def _front_window_title():
+    """(title, via) of the frontmost window: its tab's title in Warp /
+    Terminal / iTerm2 / Ghostty, where Claude Code writes its session title
+   . The window server's name needs Screen
+    Recording; without it the name is empty and Accessibility (which the key
+    posting already needs) answers instead. ('', '') when neither can."""
+    try:
+        import Quartz
+        with objc_pool():
+            wl = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly
+                | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
+            for w in wl or []:
+                if w.get("kCGWindowLayer", 1) == 0:
+                    name = str(w.get("kCGWindowName") or "")
+                    pid = int(w.get("kCGWindowOwnerPID", 0))
+                    break
+            else:
+                return "", ""
+        if name:
+            return name, "cg"
+        name = _ax_focused_title(pid) if pid else ""
+        return (name, "ax") if name else ("", "")
+    except Exception as e:
+        log("front window title failed:", e)
+        return "", ""
+
+
 def front_agent(front_str, apps=None):
     """Which seat owns the frontmost app, or None. Takes _frontmost_app()'s
     "bundle|localized" string and matches any segment against FOCUS_APPS,
@@ -930,6 +1045,158 @@ def front_follow_tick():
         active_agent = agent
     push_board({"t": "select", "agent": agent, "src": "host"})   # one delivery: two links = two echoes
     log("front follow:", front, "->", agent)
+
+
+# ---- 未读完成 (see UNREAD_KEY_GUARD_S) ----
+# Claude Code's tab spinners seen so far: ◐◓◑◒ (working) / ✳ (idle); its
+# other dingbat frames (✢✶✻✽) and braille spinners are covered by the ranges
+_TITLE_MARK = re.compile(r"^[\s*·•✀-➿⠀-⣿◐-◓]+")
+
+def title_core(t):
+    """A tab / session title without Claude Code's leading spinner or ✳."""
+    return _TITLE_MARK.sub("", str(t or "")).strip().rstrip("…").strip()
+
+
+def front_session(front_title, titles):
+    """Pure: the listed Claude session the frontmost window shows, or None.
+    Warp / Terminal / iTerm2 / Ghostty title a window after its active tab,
+    and Claude Code titles the tab with the session title behind a spinner
+    or ✳. No title (VS Code: the file name), no match, or two matches =
+    None: the marker then waits for a prompt typed into that session — it is
+    never cleared on a guess."""
+    t = title_core(front_title)
+    if not t:
+        return None
+    hits = []
+    for sid, ti in titles.items():
+        ti = title_core(ti)
+        if not ti:
+            continue
+        if t == ti or (len(ti) >= 4 and ti in t) or (len(t) >= 8 and ti.startswith(t)):
+            hits.append(sid)
+    return hits[0] if len(hits) == 1 else None
+
+
+def unread_seen(unread_at, front_since, input_at, host_key_at):
+    """Pure: the user looked at it on the Mac. Real keyboard / mouse input
+    came after it finished AND after its window reached the front (so a board
+    swipe's `open -a`, or an alt-tab fly-by, is not a look), and it is not
+    the echo of a key the host posted itself."""
+    return (input_at > unread_at and input_at > front_since
+            and input_at > host_key_at + UNREAD_KEY_GUARD_S)
+
+
+def unread_seen_at_finish(unread_at, front_since, input_at, host_key_at, now):
+    """Pure: it finished right in front of the user — its window was already
+    frontmost when it finished, and they touched the Mac (not just our own
+    posted key) within UNREAD_PRESENT_S before. Counts once the caption ran."""
+    return (front_since <= unread_at
+            and now >= unread_at + UNREAD_FRONT_GRACE_S
+            and input_at >= unread_at - UNREAD_PRESENT_S
+            and input_at > host_key_at + UNREAD_KEY_GUARD_S)
+
+
+def unread_list():
+    """Seats the board paints with a white dot, in AGENTS order (call with
+    `lock` held). Claude = any of its sessions unread."""
+    claude = any(sid in claude_sessions for sid in unread_sess)
+    return [a for a in AGENTS if (a == "claude" and claude) or a in unread_seats]
+
+
+def _hid_input_at(now):
+    """Wall time of the last keyboard / mouse event at the HID level (~0.1 ms,
+    no TCC grant). Our own posted keys count too — see UNREAD_KEY_GUARD_S."""
+    try:
+        idle = Quartz.CGEventSourceSecondsSinceLastEventType(
+            Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
+        return now - float(idle)
+    except Exception:
+        return 0.0
+
+
+def unread_clear_seen(now, listed, titles, pending=True):
+    """Track what is frontmost (every pass: "it was already in front when it
+    finished" needs the history), and while something is unread clear the
+    one seat / session in front once the user has seen it (unread_seen /
+    unread_seen_at_finish). Independent of the follow_front setting."""
+    front = _frontmost_app()
+    apps = FOCUS_APPS
+    extra = sess_term_apps()
+    if extra:                            # same Claude terminals as reverse follow
+        apps = dict(FOCUS_APPS)
+        apps["claude"] = tuple(sorted(extra | ({FOCUS_APPS["claude"]} if FOCUS_APPS.get("claude") else set())))
+    agent = front_agent(front, apps)
+    sid = None
+    if agent == "claude" and listed:
+        if len(listed) == 1:
+            sid = listed[0]              # one session: the terminal being front is enough
+        else:                            # which tab: its title (AX, ≤ 0.3 s, only while a Claude terminal is front)
+            sid = front_session(_front_window_title()[0], titles)
+    key = (agent, sid)
+    if key != _unread_front["key"]:      # just arrived: input has to come after now
+        _unread_front.update(key=key, since=now)
+        return
+    if agent is None or not pending:
+        return
+    input_at = _hid_input_at(now)
+    since = _unread_front["since"]
+    with lock:
+        if agent == "claude":
+            at = unread_sess.get(sid) if sid else None
+            if at is None:
+                return
+            how = ("input" if unread_seen(at, since, input_at, _host_key_at) else
+                   "in front" if unread_seen_at_finish(at, since, input_at, _host_key_at, now)
+                   else None)
+            if how:
+                del unread_sess[sid]
+                log("unread: claude session seen on the Mac (%s):" % how, sid[:8])
+        else:
+            at = unread_seats.get(agent)
+            if at is None:
+                return
+            how = ("input" if unread_seen(at, since, input_at, _host_key_at) else
+                   "in front" if unread_seen_at_finish(at, since, input_at, _host_key_at, now)
+                   else None)
+            if how:
+                del unread_seats[agent]
+                log("unread: seen on the Mac (%s):" % how, agent)
+
+
+def unread_tick(prev, snap):
+    """One watcher pass: mark fresh finishes, clear what the user looked at,
+    send the done captions. True when the board's "u" list changed (the
+    caller pushes the state line; the sess line follows on its own pass)."""
+    global _unread_pushed
+    now = time.time()
+    with lock:
+        if prev is not None:
+            for a in AGENTS:
+                if a == "claude":
+                    continue             # per session, from the Stop hook
+                if snap.get(a) == "done" and prev.get(a) != "done":
+                    unread_seats[a] = now
+                    _unread_caps.append({"t": "toast", "k": "done", "a": a})
+                elif snap.get(a) in ("working", "off") and a in unread_seats:
+                    del unread_seats[a]  # new work started there / the app quit
+        for sid in [s for s in unread_sess if s not in claude_sessions]:
+            del unread_sess[sid]         # the session ended
+        caps = list(_unread_caps)
+        _unread_caps.clear()
+        listed = sess_listed()
+        titles = {sid: claude_sessions[sid].get("title") for sid in listed}
+        pending = bool(unread_seats or unread_sess)
+    unread_clear_seen(now, listed, titles, pending)
+    # 3 s caption on the board; a later one simply replaces it (user 10-17)
+    for c in caps[-1:]:
+        push_board(c)
+    with lock:
+        u = unread_list()
+    if u != _unread_pushed:
+        _unread_pushed = u
+        log("unread:", u)
+        return True
+    return False
 
 
 def raise_agent_app(agent, wait=0.5):
@@ -1050,6 +1317,12 @@ except ImportError:
     Quartz = None
     _HAVE_QUARTZ = False
 
+def _host_key_stamp():
+    """Our own key events look like a hand on the HID idle clock: note when
+    we posted, so the unread check can tell them apart (UNREAD_KEY_GUARD_S)."""
+    global _host_key_at
+    _host_key_at = time.time()
+
 def _post_fn(down: bool):
     """Post a raw fn (globe) key event at the HID tap so IMEs (WeChat input
     method's hold-fn voice mode, etc.) see it exactly like the real key."""
@@ -1058,11 +1331,13 @@ def _post_fn(down: bool):
         Quartz.CGEventSetFlags(
             ev, Quartz.kCGEventFlagMaskSecondaryFn if down else 0)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    _host_key_stamp()
 
 def _tap_fn_osascript(times):
     body = "\ndelay 0.15\n".join([f"key code {FN_KEYCODE}"] * times)
     script = f'tell application "System Events"\n{body}\nend tell'
     subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    _host_key_stamp()
 
 def voice_key(start: bool):
     global voice_down
@@ -1136,6 +1411,7 @@ def post_key(spec):
             ev = Quartz.CGEventCreateKeyboardEvent(None, kc, down)
             Quartz.CGEventSetFlags(ev, flags if down else 0)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    _host_key_stamp()
     log("key posted:", spec)
 
 # ------------------------------------------------------------------ watchers
@@ -1733,16 +2009,20 @@ def sess_state(v, now):
 
 
 def sess_title_from_tail(text):
-    """Last ai-title in a transcript chunk, without Claude's '✳ ' marker."""
+    """Last session title in a transcript chunk, without Claude's '✳ ' marker.
+    Older Claude Code wrote {"type":"ai-title","aiTitle":…}; newer builds
+    write {"type":"custom-title","customTitle":…} instead (seen 2026-10-17:
+    every listed session had fallen back to its folder name). Either one is
+    the string Claude Code also puts in the terminal tab's title."""
     title = None
     for line in text.splitlines():
-        if '"ai-title"' not in line:
+        if '"ai-title"' not in line and '"custom-title"' not in line:
             continue
         try:
             m = json.loads(line)
         except ValueError:
             continue                      # the cut-off first line of a tail
-        t = str(m.get("aiTitle") or "").strip()
+        t = str(m.get("aiTitle") or m.get("customTitle") or "").strip()
         if t:
             title = t
     if title:
@@ -1803,9 +2083,10 @@ def sess_policy(order, prev_order, states, prev, cur, needs_since, activity,
     return cur, relay_at, jumped
 
 
-def sess_build_msg(order, recs, states, cur, titles, labels):
+def sess_build_msg(order, recs, states, cur, titles, labels, unread=()):
     """The {"t":"sess"} line. Fewer than two sessions = empty list, and the
-    board draws nothing (one session looks exactly like before)."""
+    board draws nothing (one session looks exactly like before). A session
+    in `unread` (finished, not yet looked at on the Mac) carries "u": 1."""
     if len(order) < 2:
         return {"t": "sess", "a": "claude", "cur": "", "list": []}
     show = list(order)
@@ -1817,6 +2098,9 @@ def sess_build_msg(order, recs, states, cur, titles, labels):
     items = [{"id": sid[:8], "ti": utf8_cut(titles.get(sid) or "", SESS_TITLE_MAX),
               "dir": utf8_cut(labels.get(sid) or "", SESS_DIR_MAX),
               "st": states.get(sid, "idle")} for sid in show]
+    for it, sid in zip(items, show):
+        if sid in unread:
+            it["u"] = 1
     return {"t": "sess", "a": "claude", "cur": (cur or "")[:8], "list": items}
 
 
@@ -2085,7 +2369,8 @@ def sess_tick(io=True):
         _sess_prev, _sess_prev_order = states, order
         titles = {sid: claude_sessions[sid].get("title") for sid in order}
         labels = sess_dir_labels(order, claude_sessions)
-        msg = sess_build_msg(order, claude_sessions, states, cur, titles, labels)
+        msg = sess_build_msg(order, claude_sessions, states, cur, titles, labels,
+                             set(unread_sess))
         fake = _sess_fake["msg"] if _sess_fake["until"] > now else None
         agent_now = active_agent
     if arm is not None:                   # land the hand-over on time, not on the next tick
@@ -2338,6 +2623,9 @@ def test_sess(path):
             it["ti"] = ""
     if q.get("t0") and items:             # e.g. a long title for the 300 px cut
         items[0]["ti"] = utf8_cut(q["t0"], SESS_TITLE_MAX)
+    for it, u in zip(items, q.get("u", "").split(",")):   # u=0,1: unread dots
+        if u.strip() == "1":
+            it["u"] = 1
     msg = {"t": "sess", "a": "claude", "cur": items[cur]["id"] if n >= 2 else "",
            "list": items if n >= 2 else []}
     secs = float(q.get("s", 30) or 30)
@@ -2621,11 +2909,18 @@ def watcher_loop():
         with lock:
             snap = dict(state)
         report_tick(prev, snap)
+        try:
+            u_moved = unread_tick(prev, snap)    # 未读完成
+        except Exception as e:
+            u_moved = False
+            log("unread error:", e)
         if snap != prev:
             log("state:", snap)
             push_state()
             speak_events(prev, snap)
             prev = snap
+        elif u_moved:
+            push_state()
         ticks += 1
         if ticks % 600 == 0:      # every ~10 min: re-sync the board clock
             push_time()
@@ -4173,7 +4468,8 @@ _state_push_lock = threading.Lock()      # keep two callers' state lines in orde
 def push_state():
     with _state_push_lock:
         with lock:
-            msg = (json.dumps({"t": "state", "agents": state}) + "\n").encode()
+            msg = (json.dumps({"t": "state", "agents": state, "u": unread_list()})
+                   + "\n").encode()
         push_raw(msg)                    # via tcp_send: never splice into a file push
 
 send_lock = threading.Lock()     # one JSON line at a time on the board sockets
@@ -7872,11 +8168,14 @@ class HookHandler(BaseHTTPRequestHandler):
         elif self.path == "/test/front":
             # what the focus insurance would see right now (fresh query)
             front = _frontmost_app()
+            title, via = _front_window_title()
             self._ok(json.dumps({"front": front,
                                  "target": FOCUS_APPS.get(active_agent),
                                  "active": active_agent,
                                  "follow_cand": front_agent(front),
-                                 "follow_enabled": FOLLOW_FRONT}).encode())
+                                 "follow_enabled": FOLLOW_FRONT,
+                                 "title": title, "title_via": via},
+                                ensure_ascii=False).encode())
         elif self.path.startswith("/test/mic"):
             # board microphone (mic-blackhole branch):
             #   /test/mic/start | /stop      stream on/off ({"t":"mic","on":N})
@@ -8152,6 +8451,32 @@ class HookHandler(BaseHTTPRequestHandler):
         elif self.path == "/test/toast/mac_approve":
             push_board({"t": "toast", "k": "mac_approve"})
             self._ok()
+        elif self.path.startswith("/test/unread"):
+            # 未读完成: /test/unread?a=codex marks a
+            # seat unread + its 3 s caption, exactly as a real finish would
+            # (it clears the real way: look at Codex on the Mac);
+            # ?a=claude&id=<id8> = one session (a real id also marks it; a
+            # /test/sess fake id only captions — fake dots: /test/sess?u=0,1);
+            # /test/unread/off clears everything.
+            q = dict(parse_qsl(self.path.partition("?")[2]))
+            now = time.time()
+            with lock:
+                if self.path.startswith("/test/unread/off"):
+                    unread_seats.clear()
+                    unread_sess.clear()
+                else:
+                    a = q.get("a", "")
+                    if a == "claude":
+                        id8 = q.get("id", "")[:8]
+                        sid = next((s for s in claude_sessions if id8 and s.startswith(id8)), None)
+                        if sid:
+                            unread_sess[sid] = now
+                        _unread_caps.append({"t": "toast", "k": "done", "a": "claude", "id": id8})
+                    elif a in AGENTS:
+                        unread_seats[a] = now
+                        _unread_caps.append({"t": "toast", "k": "done", "a": a})
+                u = unread_list()
+            self._ok(json.dumps({"ok": True, "unread": u}).encode())
         elif self.path.startswith("/test/pin/"):
             # 钉住 debug (doc/06): /test/pin/1 locks the pet page to the hand
             # (gravity only turns it upright), /test/pin/0 releases it. Single
@@ -8310,6 +8635,7 @@ def claude_hook(event, p, meta=None):
         if event == "UserPromptSubmit":
             _sess_typed = sid                 # the board follows the tab you type in
             _sess_front["sid"] = sid          # ... and that tab is the one in front
+            unread_sess.pop(sid, None)        # typing into it = looked at it
         if event in ("PreToolUse", "PostToolUse", "UserPromptSubmit"):
             s["state"] = "working"
         elif event == "Notification":
@@ -8334,6 +8660,9 @@ def claude_hook(event, p, meta=None):
         elif event == "Stop":
             s["state"] = "idle"
             s["done_until"] = now + DONE_LINGER
+            if s.get("tty"):                  # a terminal session: `claude -p` runs have none
+                unread_sess[sid] = now
+                _unread_caps.append({"t": "toast", "k": "done", "a": "claude", "id": sid[:8]})
         elif event == "SessionStart":
             s["state"] = "idle"
         elif event == "SessionEnd":

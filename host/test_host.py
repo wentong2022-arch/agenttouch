@@ -4628,5 +4628,118 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertIn("src=agentpet", c)
 
 
+class UnreadDoneTests(unittest.TestCase):
+    """a finished seat / Claude session stays unread
+    until the user looks at it on the Mac. Nothing here queries the window
+    server: the front-app check is patched out where a tick would run it."""
+
+    def setUp(self):
+        self._saved = dict(H.claude_sessions)
+        H.claude_sessions.clear()
+        H.unread_seats.clear()
+        H.unread_sess.clear()
+        H._unread_caps.clear()
+        H._unread_pushed = None
+        self.sent = []
+        self._p = [mock.patch.object(H, "push_raw", lambda msg: None),
+                   mock.patch.object(H, "inject", lambda fn: None),
+                   mock.patch.object(H, "push_board", self.sent.append),
+                   mock.patch.object(H, "unread_clear_seen", lambda *a: None)]
+        for p in self._p:
+            p.start()
+
+    def tearDown(self):
+        for p in self._p:
+            p.stop()
+        H.claude_sessions.clear()
+        H.claude_sessions.update(self._saved)
+        H.unread_seats.clear()
+        H.unread_sess.clear()
+        H._unread_caps.clear()
+
+    def test_custom_title_is_read(self):
+        tail = ('{"type":"ai-title","aiTitle":"Old name"}\n'
+                '{"type":"custom-title","customTitle":"Fix the parser","sessionId":"s"}\n')
+        self.assertEqual(H.sess_title_from_tail(tail), "Fix the parser")
+
+    def test_front_session_matches_the_tab_title(self):
+        T = {"a": "Fix the parser", "b": "Release notes draft"}
+        F = H.front_session
+        self.assertEqual(F("✳ Fix the parser", T), "a")             # idle tab
+        self.assertEqual(F("◑ Release notes draft", T), "b")       # working spinner
+        self.assertEqual(F("⠐ Release notes draft", T), "b")  # braille spinner
+        self.assertEqual(F("✻ Release notes draft", T), "b")  # dingbat spinner frame
+        self.assertEqual(F("✳ Fix the parser — claude — 80×24", T), "a")   # Terminal.app suffix
+        self.assertEqual(F("Release notes d…", T), "b")            # a cut title
+        self.assertIsNone(F("~/projects/demo", T))                  # a plain shell tab
+        self.assertIsNone(F("main.py — project", T))               # VS Code: the file name
+        self.assertIsNone(F("", T))
+        self.assertIsNone(F("✳ Fix the parser", {"a": "Fix the parser", "c": "Fix the parser"}))  # twins
+
+    def test_seen_needs_input_after_finish_and_front(self):
+        S = H.unread_seen
+        g = H.UNREAD_KEY_GUARD_S
+        self.assertTrue(S(100, 90, 105, 0))           # already front, then a key press
+        self.assertFalse(S(100, 90, 99, 0))           # last input was before it finished
+        self.assertFalse(S(100, 110, 108, 0))         # a board swipe raised it at 110, no hand since
+        self.assertTrue(S(100, 110, 112, 0))
+        self.assertFalse(S(100, 90, 105, 105 - g / 2))   # that "input" was our own fn / Enter
+        self.assertTrue(S(100, 90, 105, 105 - 2 * g))
+
+    def test_seen_when_it_finished_in_front(self):
+        S = H.unread_seen_at_finish
+        g, P = H.UNREAD_FRONT_GRACE_S, H.UNREAD_PRESENT_S
+        self.assertTrue(S(100, 50, 95, 0, 100 + g))         # tab in front, hands near the Mac
+        self.assertFalse(S(100, 50, 95, 0, 100 + g / 2))    # the caption is still running
+        self.assertFalse(S(100, 101, 95, 0, 110))           # came forward only after it finished
+        self.assertFalse(S(100, 50, 100 - P - 1, 0, 110))   # away from the Mac: wait for a touch
+        self.assertFalse(S(100, 50, 95, 95, 110))           # that last "touch" was our own fn
+
+    def test_seat_done_edge_marks_and_captions(self):
+        prev = {a: "idle" for a in H.AGENTS}
+        snap = dict(prev, codex="done")
+        self.assertTrue(H.unread_tick(prev, snap))
+        self.assertEqual(H.unread_list(), ["codex"])
+        self.assertEqual(self.sent, [{"t": "toast", "k": "done", "a": "codex"}])
+        self.assertFalse(H.unread_tick(snap, snap))   # still done: no new caption, no change
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(H.unread_tick(snap, dict(snap, codex="idle")) is False)   # 90 s later: stays
+        self.assertTrue(H.unread_tick(snap, dict(snap, codex="working")))         # new task = seen
+        self.assertEqual(H.unread_list(), [])
+
+    def test_two_finishes_in_one_pass_caption_the_last(self):
+        prev = {a: "idle" for a in H.AGENTS}
+        H.unread_tick(prev, dict(prev, codex="done", qoder="done"))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(H.unread_list(), ["codex", "qoder"])
+
+    def test_claude_session_stop_and_prompt(self):
+        meta = {"hpid": 4242, "tty": "/dev/ttys009"}
+        H.claude_hook("UserPromptSubmit", {"session_id": "sess-aaaa1"}, meta)
+        H.claude_hook("Stop", {"session_id": "sess-aaaa1"}, meta)
+        H.claude_hook("Stop", {"session_id": "pipe-run"}, {})       # `claude -p`: no terminal
+        self.assertEqual(set(H.unread_sess), {"sess-aaaa1"})
+        self.assertEqual(H.unread_list(), ["claude"])
+        snap = {a: "idle" for a in H.AGENTS}
+        H.unread_tick(snap, snap)
+        self.assertEqual(self.sent[-1], {"t": "toast", "k": "done", "a": "claude", "id": "sess-aaa"})
+        H.claude_hook("UserPromptSubmit", {"session_id": "sess-aaaa1"}, meta)
+        self.assertEqual(H.unread_list(), [])
+
+    def test_sess_line_carries_u(self):
+        recs = {"aaaaaaaa-1": {}, "bbbbbbbb-2": {}}
+        m = H.sess_build_msg(["aaaaaaaa-1", "bbbbbbbb-2"], recs, {}, "aaaaaaaa-1", {}, {},
+                             {"bbbbbbbb-2"})
+        self.assertNotIn("u", m["list"][0])
+        self.assertEqual(m["list"][1]["u"], 1)
+
+    def test_state_line_lists_unread(self):
+        H.unread_seats["qoder"] = 1.0
+        lines = []
+        with mock.patch.object(H, "push_raw", lines.append):
+            H.push_state()
+        self.assertEqual(json.loads(lines[-1])["u"], ["qoder"])
+
+
 if __name__ == "__main__":
     unittest.main()

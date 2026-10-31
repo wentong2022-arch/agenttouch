@@ -63,7 +63,7 @@ LOG_PATH = Path("/tmp/agentpet_host.log")
 
 # Which board this host serves: the first log line, /state and `pet status` say it.
 PRODUCT = "s3"
-HOST_VERSION = "2026-10-17b"
+HOST_VERSION = "2026-10-20a"
 
 # `forest` (Qoder Forest, the "Qoder CN.app" desktop client, split from the
 # IDE seat 2026-09-13) MUST stay last: report_msg() emits w[]/d[] in
@@ -3327,6 +3327,24 @@ def board_snapshot():
             "link_reason": "" if (_ble_client is not None or boards) else ble_reason,
             "hello_age_s": round(now - board_hello_at) if board_hello_at else None}
 
+_tcp_card_pushes_due = [False]
+
+def tcp_card_pushes():
+    """What a TCP hello from a board with a card sets off: these all need the
+    Wi-Fi link in `boards`. With BLE attached that hello arrives over BLE
+    before BoardHandler admits the socket, so it runs from there instead."""
+    _tcp_card_pushes_due[0] = False
+    threading.Thread(target=fonts_ensure, args=(2,), daemon=True).start()
+    threading.Thread(target=push_queue_drain, daemon=True).start()
+    def _year():
+        time.sleep(3)                          # let hello traffic settle
+        r = almanac_push_year()
+        if not r.get("skipped"):
+            log("almanac year push:", r)
+    threading.Thread(target=_year, daemon=True).start()
+    threading.Thread(target=au_push_pending, args=(6,),   # after the almanac, same reason
+                     daemon=True).start()
+
 def handle_board_msg(raw, reply):
     global active_agent, board_sd, board_sd_at, board_rtc, board_rtc_at, board_rtc_boot
     global board_build, board_part, board_hello_at, board_select_at, _board_min_floor, board_skins
@@ -3371,16 +3389,12 @@ def handle_board_msg(raw, reply):
             if not m.get("sd"):
                 font_step("nocard")
             if m.get("sd") and not m.get("link"):        # TCP hello + card present
-                threading.Thread(target=fonts_ensure, args=(2,), daemon=True).start()
-                threading.Thread(target=push_queue_drain, daemon=True).start()
-                def _year():
-                    time.sleep(3)                          # let hello traffic settle
-                    r = almanac_push_year()
-                    if not r.get("skipped"):
-                        log("almanac year push:", r)
-                threading.Thread(target=_year, daemon=True).start()
-                threading.Thread(target=au_push_pending, args=(6,),   # after the almanac, same reason
-                                 daemon=True).start()
+                with lock:
+                    tcp_up = bool(boards)
+                if tcp_up:
+                    tcp_card_pushes()
+                else:       # it came over BLE; the socket is admitted on its first beat
+                    _tcp_card_pushes_due[0] = True
         if not m.get("link"):            # TCP: say who we are (IP drift, first owner)
             reply(hostinfo_msg())
         reply(time_msg())
@@ -5779,9 +5793,23 @@ def stretch_tick():
 
 _stall_until = [0.0]     # /test/mic/stall: the board reader pauses recv() until then (link-stall simulation)
 
+# A connection becomes a board when it greets: a hello, or -- when BLE is
+# attached the firmware's sendJson routes the TCP hello over BLE (10-20 07:47,
+# the link cycled every 10 s) -- the heartbeat ping it puts on each link every
+# 10 s. Till then it is not in `boards` and moves no link clocks; any other
+# first line, or silence past a skipped beat, closes it.
+BOARD_HELLO_WAIT = 30
+
+def board_line_greets(raw):
+    try:
+        m = json.loads(raw)
+    except ValueError:
+        return False
+    return isinstance(m, dict) and m.get("t") in ("hello", "ping")
+
 class BoardHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        global _tcp_rx_at
+        global _tcp_rx_at, _tcp_last_link_at
         sockc = self.request
         if links_paused():
             # Mac asleep or in a dark wake: the board retries every 3 s, and
@@ -5793,14 +5821,12 @@ class BoardHandler(socketserver.BaseRequestHandler):
             if first:
                 log("board connect turned away: the Mac is asleep (links resume when the display is on)")
             return
-        sockc.settimeout(60)
+        sockc.settimeout(BOARD_HELLO_WAIT)
         # Every line is < MSS: with Nagle on, each one waited for the board's
         # delayed ACK (~25 ms) -> file/PCM pushes crawled at ~40 KB/s.
         sockc.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         log("board connected:", self.client_address)
-        with lock:
-            boards.append(sockc)
-        push_state()
+        greeted = False
         buf = b""
         try:
             while True:
@@ -5809,21 +5835,39 @@ class BoardHandler(socketserver.BaseRequestHandler):
                 data = sockc.recv(1024)
                 if not data:
                     break
-                _tcp_rx_at = time.time()
                 buf += data
+                if greeted:
+                    _tcp_rx_at = time.time()
+                elif len(buf) > 4096:
+                    log("board connect dropped: no hello in the first 4 KB", self.client_address)
+                    break
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
+                    if not greeted:
+                        if not board_line_greets(line):
+                            log("board connect dropped: first line is not a hello / ping",
+                                self.client_address, line[:40])
+                            return
+                        greeted = True
+                        _tcp_rx_at = time.time()
+                        sockc.settimeout(60)
+                        with lock:
+                            boards.append(sockc)
+                        push_state()
+                        if _tcp_card_pushes_due[0]:
+                            tcp_card_pushes()
                     self.on_msg(line)
         except OSError:
-            pass
+            if not greeted:
+                log("board connect dropped: no hello within %d s" % BOARD_HELLO_WAIT, self.client_address)
         finally:
-            with lock:
-                if sockc in boards:
-                    boards.remove(sockc)
-            board_link_down()          # vitals stay readable, just not current
-            global _tcp_last_link_at
-            _tcp_last_link_at = time.time()
-            log("board disconnected")
+            if greeted:
+                with lock:
+                    if sockc in boards:
+                        boards.remove(sockc)
+                board_link_down()          # vitals stay readable, just not current
+                _tcp_last_link_at = time.time()
+                log("board disconnected")
 
     def on_msg(self, raw):
         def reply(data):
@@ -7999,6 +8043,35 @@ def state_snapshot():
                 "probe": {"seen": dict(proc_seen), "cpu": dict(proc_cpu),
                           "busy": dict(cpu_busy)}}
 
+# 8788 serves hooks, `pet`, curl and the settings page, all from this Mac by
+# 127.0.0.1. A request a browser sends for some other site's page carries
+# Origin / Sec-Fetch-Site from that site or another Host name, and gets a 403.
+_HTTP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+_HTTP_ORIGINS = tuple("http://%s:%d" % (h, HTTP_PORT) for h in _HTTP_HOSTS)
+
+def http_gate(headers, method="GET", path=""):
+    """None when the request may run, else why it was turned away. One
+    cross-site request passes: opening the settings page itself -- Chrome
+    marks even its New Tab page and a link in a doc cross-site (10-20), and
+    loading that HTML does nothing; everything it then fetches is same-origin."""
+    host = (headers.get("Host") or "").strip().lower()
+    if host:
+        name = host.split("]")[0] + "]" if host.startswith("[") else host.split(":")[0]
+        if name not in _HTTP_HOSTS:
+            return "host " + host[:60]
+    origin = headers.get("Origin")
+    if origin is not None and origin.strip().lower() not in _HTTP_ORIGINS:
+        return "origin " + origin[:60]        # "null" too: sandboxed frames send it
+    site = headers.get("Sec-Fetch-Site")
+    if (method == "GET" and path.split("?")[0] == "/settings"
+            and headers.get("Sec-Fetch-Mode") == "navigate"):
+        return None
+    if site is not None and site.strip().lower() not in ("same-origin", "none"):
+        return "sec-fetch-site " + site[:20]
+    return None
+
+_http_refused = [0]
+
 class HookHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -8009,7 +8082,23 @@ class HookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _gate(self):
+        """False (403 already sent) for a request a web page made; see http_gate."""
+        why = http_gate(self.headers, self.command, self.path)
+        if why is None:
+            return True
+        _http_refused[0] += 1
+        if _http_refused[0] <= 20 or _http_refused[0] % 100 == 0:
+            log("http refused (#%d):" % _http_refused[0], self.command, self.path[:60], why)
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"forbidden")
+        return False
+
     def do_GET(self):
+        if not self._gate():
+            return
         if self.path == "/settings":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -8622,6 +8711,8 @@ class HookHandler(BaseHTTPRequestHandler):
             self._ok(b"agentpet")
 
     def do_POST(self):
+        if not self._gate():
+            return
         n = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(n) if n else b"{}"
         try:

@@ -2138,12 +2138,20 @@ class NowPlayingBoardMsgTests(unittest.TestCase):
         old_pend, old_year = H.au_push_pending, H.almanac_push_year
         H.au_push_pending = lambda delay=0.0: (got.append(delay), done.set(), [])[2]
         H.almanac_push_year = lambda *a, **k: {"ok": True, "skipped": "test"}
+        old_boards, old_due = list(H.boards), H._tcp_card_pushes_due[0]
+        hello = json.dumps({"t": "hello", "dev": "amoled216", "sd": 32000, "sdrw": True})
         try:
-            H.handle_board_msg(json.dumps({"t": "hello", "dev": "amoled216",
-                                           "sd": 32000, "sdrw": True}), lambda _b: None)
+            H.boards[:] = []                       # BLE carried the TCP hello: wait for the socket
+            H.handle_board_msg(hello, lambda _b: None)
+            self.assertFalse(done.wait(0.3))
+            self.assertTrue(H._tcp_card_pushes_due[0])
+            H.boards[:] = [object()]               # socket already admitted: push now
+            H.handle_board_msg(hello, lambda _b: None)
             self.assertTrue(done.wait(3), "hello never reached au_push_pending")
+            self.assertFalse(H._tcp_card_pushes_due[0])
         finally:
             H.au_push_pending, H.almanac_push_year = old_pend, old_year
+            H.boards[:], H._tcp_card_pushes_due[0] = old_boards, old_due
         self.assertEqual(len(got), 1)
 
     def test_a_ble_hello_does_not_start_a_card_push(self):
@@ -4818,6 +4826,150 @@ class UnreadDoneTests(unittest.TestCase):
         with mock.patch.object(H, "push_raw", lines.append):
             H.push_state()
         self.assertEqual(json.loads(lines[-1])["u"], ["qoder"])
+
+
+
+class HttpGateTests(unittest.TestCase):
+    """8788 takes curl, hooks and the settings page; a request a browser
+    sends for another site's page gets a 403."""
+    def test_the_verdict(self):
+        g = H.http_gate
+        self.assertIsNone(g({}))                                          # HTTP/1.0, no Host
+        self.assertIsNone(g({"Host": "127.0.0.1:8788"}))                  # curl, hooks, pet
+        self.assertIsNone(g({"Host": "LOCALHOST:8788"}))
+        self.assertIsNone(g({"Host": "[::1]:8788"}))
+        self.assertIsNone(g({"Host": "127.0.0.1"}))
+        self.assertIsNone(g({"Host": "127.0.0.1:8788", "Origin": "http://127.0.0.1:8788",
+                             "Sec-Fetch-Site": "same-origin"}))           # the settings page
+        self.assertIsNone(g({"Host": "127.0.0.1:8788", "Sec-Fetch-Site": "none"}))   # typed in the bar
+        self.assertIn("host", g({"Host": "other.example:8788"}))
+        self.assertIn("host", g({"Host": "127.0.0.1.other.example"}))
+        self.assertIn("origin", g({"Host": "127.0.0.1:8788", "Origin": "https://other.example"}))
+        self.assertIn("origin", g({"Host": "127.0.0.1:8788", "Origin": "null"}))
+        self.assertIn("origin", g({"Host": "127.0.0.1:8788", "Origin": "http://127.0.0.1:9999"}))
+        self.assertIn("sec-fetch-site", g({"Host": "127.0.0.1:8788", "Sec-Fetch-Site": "cross-site"}))
+        self.assertIn("sec-fetch-site", g({"Host": "127.0.0.1:8788", "Sec-Fetch-Site": "same-site"}))
+        nav = {"Host": "127.0.0.1:8788", "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+        self.assertIsNone(g(nav, "GET", "/settings"))                    # a link / Chrome's New Tab page
+        self.assertIn("sec-fetch-site", g(nav, "GET", "/test/approve"))  # a link to an action is not
+        self.assertIn("sec-fetch-site", g(nav, "POST", "/settings"))
+        self.assertIn("host", g(dict(nav, Host="other.example"), "GET", "/settings"))
+
+    def test_a_cross_site_request_is_refused_before_it_does_anything(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H.HookHandler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close(), th.join(5)))
+        base = "http://127.0.0.1:%d" % srv.server_address[1]
+        calls, lines = [], []
+        for name, fn in (("decision_key", lambda *a: calls.append(("decision", a))),
+                         ("post_key", lambda *a: calls.append(("key", a))),
+                         ("save_settings", lambda p: calls.append(("save", p)) or {}),
+                         ("log", lambda *a: lines.append(" ".join(map(str, a))))):
+            p = mock.patch.object(H, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+        def code(path, headers, data=None):
+            try:
+                with urlopen(Request(base + path, data=data, headers=headers), timeout=10) as r:
+                    return r.status
+            except Exception as e:                     # HTTPError carries the code
+                return getattr(e, "code", None)
+
+        foreign = {"Origin": "https://other.example", "Sec-Fetch-Site": "cross-site"}
+        self.assertEqual(code("/test/approve", foreign), 403)
+        self.assertEqual(code("/test/key/cmd+z", {"Sec-Fetch-Site": "cross-site"}), 403)
+        self.assertEqual(code("/settings/save", dict(foreign, **{"Content-Type": "text/plain"}),
+                              b'{"lang":"en"}'), 403)
+        self.assertEqual(code("/state", {"Host": "other.example"}), 403)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("http refused" in l and "/test/approve" in l for l in lines))
+        self.assertEqual(code("/test/approve", {}), 200)                    # curl still works
+        self.assertEqual(code("/settings/save", {"Content-Type": "application/json",
+                                                  "Origin": "http://127.0.0.1:8788",
+                                                  "Sec-Fetch-Site": "same-origin"},
+                              b'{"lang":"en"}'), 200)                       # the settings page too
+        self.assertEqual([c[0] for c in calls], ["decision", "save"])
+
+
+class BoardHelloGateTests(unittest.TestCase):
+    """A connection is not a board until its first line is a hello, or the
+    heartbeat ping (with BLE attached the firmware
+    sends its TCP hello over BLE, 10-20)."""
+    def setUp(self):
+        import socket
+        self.socket = socket
+        self.saved = list(H.boards), H._tcp_rx_at, H._tcp_last_link_at, H.BOARD_HELLO_WAIT
+        H.boards[:] = []
+        H._tcp_rx_at = H._tcp_last_link_at = 0.0
+        self.msgs, self.lines, self.seen = [], [], []
+        for name, fn in (("links_paused", lambda: False),
+                         ("push_state", lambda: self.seen.append(list(H.boards))),
+                         ("board_link_down", lambda: None),
+                         ("handle_board_msg", lambda raw, reply: self.msgs.append(json.loads(raw)["t"])),
+                         ("log", lambda *a: self.lines.append(" ".join(map(str, a))))):
+            p = mock.patch.object(H, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        H.boards[:], H._tcp_rx_at, H._tcp_last_link_at, H.BOARD_HELLO_WAIT = self.saved
+
+    def run_board(self, data, close=True):
+        ls = self.socket.create_server(("127.0.0.1", 0))         # TCP: the handler sets NODELAY
+        b = self.socket.create_connection(ls.getsockname())
+        a, _ = ls.accept()
+        ls.close()
+        self.addCleanup(a.close); self.addCleanup(b.close)
+        b.sendall(data)
+        if close:
+            b.shutdown(self.socket.SHUT_WR)
+        H.BoardHandler(a, ("10.0.0.66", 5000), None)
+        return b
+
+    def test_a_key_before_hello_is_dropped_with_the_connection(self):
+        self.run_board(b'{"t":"key","k":"approve"}\n{"t":"hello","dev":"amoled216"}\n')
+        self.assertEqual(self.msgs, [])
+        self.assertEqual(self.seen, [])                                     # never in boards
+        self.assertEqual(H._tcp_rx_at, 0.0)                                 # moved no link clock
+        self.assertEqual(H._tcp_last_link_at, 0.0)
+        self.assertTrue(any("first line is not a hello" in l for l in self.lines))
+
+    def test_a_hello_makes_it_a_board(self):
+        self.run_board(b'{"t":"hello","dev":"amoled216","v":2}\n{"t":"key","k":"approve"}\n')
+        self.assertEqual(self.msgs, ["hello", "key"])
+        self.assertEqual(len(self.seen), 1)
+        self.assertEqual(len(self.seen[0]), 1)                              # in boards for the push
+        self.assertEqual(H.boards, [])                                      # and out again on close
+        self.assertGreater(H._tcp_rx_at, 0.0)
+        self.assertGreater(H._tcp_last_link_at, 0.0)
+        self.assertTrue(any("board disconnected" in l for l in self.lines))
+
+    def test_with_ble_attached_the_heartbeat_greets(self):
+        self.run_board(b'{"t":"ping","up":20,"heap":7217180}\n{"t":"fack","id":1}\n')
+        self.assertEqual(self.msgs, ["ping", "fack"])
+        self.assertEqual(len(self.seen), 1)
+        self.assertGreater(H.BOARD_HELLO_WAIT, 20)                          # a skipped 10 s beat
+
+    def test_card_pushes_wait_for_the_socket_when_the_hello_came_over_ble(self):
+        fired = []
+        p = mock.patch.object(H, "tcp_card_pushes", lambda: fired.append(1))
+        p.start()
+        self.addCleanup(p.stop)
+        H._tcp_card_pushes_due[0] = True                    # hello handler: no TCP board yet
+        self.run_board(b'{"t":"ping","up":20}\n')
+        self.assertEqual(fired, [1])
+
+    def test_silence_or_a_flood_without_hello_is_dropped(self):
+        H.BOARD_HELLO_WAIT = 0.2
+        t0 = time.monotonic()
+        self.run_board(b"", close=False)
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertTrue(any("no hello within" in l for l in self.lines))
+        self.run_board(b"x" * 5000)
+        self.assertTrue(any("no hello in the first 4 KB" in l for l in self.lines))
+        self.assertEqual(self.msgs, [])
 
 
 if __name__ == "__main__":
